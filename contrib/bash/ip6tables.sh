@@ -28,7 +28,7 @@
 which ip6tables
 
 # Inbound TCP ports
-TCP_INPUT_PORTS=""
+TCP_INPUT_PORTS="22"
 
 # Inbound UDP ports
 UDP_INPUT_PORTS=""
