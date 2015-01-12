@@ -39,6 +39,9 @@ echo-request \
 echo-reply \
 "
 
+# Allowed hosts
+ALLOWED_HOSTS="fcde:a3a9:450d:7f35:1791:7932:dc3d:fa67"
+
 # There is no 'assert a chain exists.
 ip6tables -N CJD || ip6tables -F CJD
 # Link the new table into the master INPUT table.
@@ -68,6 +71,13 @@ if [ -n "$UDP_INPUT_PORTS" ] ; then
   ip6tables -A CJD -m state --state NEW -p udp --dport ${PORT} \
   -j ACCEPT
  done
+fi
+
+# Open allowed hosts if any
+if [ -n "$ALLOWED_HOSTS" ] ; then
+  for HOST in $ALLOWED_HOSTS; do
+    ip6tables -A CJD -m state --state NEW -p tcp -s ${HOST} -j ACCEPT
+  done
 fi
 
 # Deny all other traffic on tun0
