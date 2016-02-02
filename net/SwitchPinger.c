@@ -26,9 +26,9 @@
 #include "wire/Error.h"
 
 
-struct SwitchPinger
+struct SwitchPinger_pvt
 {
-    struct Interface* iface;
+    struct SwitchPinger pub;
 
     struct Pinger* pinger;
 
@@ -68,7 +68,7 @@ struct Ping
     struct SwitchPinger_Ping pub;
     uint64_t label;
     String* data;
-    struct SwitchPinger* context;
+    struct SwitchPinger_pvt* context;
     SwitchPinger_ResponseCallback onResponse;
     void* onResponseContext;
     struct Pinger_Ping* pingerPing;
@@ -76,9 +76,9 @@ struct Ping
 };
 
 // incoming message from network, pointing to the beginning of the switch header.
-static uint8_t receiveMessage(struct Message* msg, struct Interface* iface)
+static Iface_DEFUN messageFromControlHandler(struct Message* msg, struct Iface* iface)
 {
-    struct SwitchPinger* ctx = Identity_check((struct SwitchPinger*) iface->receiverContext);
+    struct SwitchPinger_pvt* ctx = Identity_check((struct SwitchPinger_pvt*) iface);
     struct SwitchHeader* switchHeader = (struct SwitchHeader*) msg->bytes;
     ctx->incomingLabel = Endian_bigEndianToHost64(switchHeader->label_be);
     ctx->incomingVersion = 0;
@@ -95,48 +95,48 @@ static uint8_t receiveMessage(struct Message* msg, struct Interface* iface)
     Assert_true(handle == 0xffffffff);
 
     struct Control* ctrl = (struct Control*) msg->bytes;
-    if (ctrl->type_be == Control_PONG_be) {
-        Message_shift(msg, -Control_HEADER_SIZE, NULL);
+    if (ctrl->header.type_be == Control_PONG_be) {
+        Message_shift(msg, -Control_Header_SIZE, NULL);
         ctx->error = Error_NONE;
         if (msg->length >= Control_Pong_MIN_SIZE) {
             struct Control_Ping* pongHeader = (struct Control_Ping*) msg->bytes;
             ctx->incomingVersion = Endian_bigEndianToHost32(pongHeader->version_be);
             if (pongHeader->magic != Control_Pong_MAGIC) {
                 Log_debug(ctx->logger, "dropped invalid switch pong");
-                return Error_INVALID;
+                return NULL;
             }
             Message_shift(msg, -Control_Pong_HEADER_SIZE, NULL);
         } else {
             Log_debug(ctx->logger, "got runt pong message, length: [%d]", msg->length);
-            return Error_INVALID;
+            return NULL;
         }
 
-    } else if (ctrl->type_be == Control_KEYPONG_be) {
-        Message_shift(msg, -Control_HEADER_SIZE, NULL);
+    } else if (ctrl->header.type_be == Control_KEYPONG_be) {
+        Message_shift(msg, -Control_Header_SIZE, NULL);
         ctx->error = Error_NONE;
         if (msg->length >= Control_KeyPong_HEADER_SIZE && msg->length <= Control_KeyPong_MAX_SIZE) {
             struct Control_KeyPing* pongHeader = (struct Control_KeyPing*) msg->bytes;
             ctx->incomingVersion = Endian_bigEndianToHost32(pongHeader->version_be);
             if (pongHeader->magic != Control_KeyPong_MAGIC) {
                 Log_debug(ctx->logger, "dropped invalid switch key-pong");
-                return Error_INVALID;
+                return NULL;
             }
-            Bits_memcpyConst(ctx->incomingKey, pongHeader->key, 32);
+            Bits_memcpy(ctx->incomingKey, pongHeader->key, 32);
             Message_shift(msg, -Control_KeyPong_HEADER_SIZE, NULL);
         } else if (msg->length > Control_KeyPong_MAX_SIZE) {
             Log_debug(ctx->logger, "got overlong key-pong message, length: [%d]", msg->length);
-            return Error_INVALID;
+            return NULL;
         } else {
             Log_debug(ctx->logger, "got runt key-pong message, length: [%d]", msg->length);
-            return Error_INVALID;
+            return NULL;
         }
 
-    } else if (ctrl->type_be == Control_ERROR_be) {
-        Message_shift(msg, -Control_HEADER_SIZE, NULL);
+    } else if (ctrl->header.type_be == Control_ERROR_be) {
+        Message_shift(msg, -Control_Header_SIZE, NULL);
         Assert_true((uint8_t*)&ctrl->content.error.errorType_be == msg->bytes);
-        if (msg->length < (Control_Error_HEADER_SIZE + SwitchHeader_SIZE + Control_HEADER_SIZE)) {
+        if (msg->length < (Control_Error_HEADER_SIZE + SwitchHeader_SIZE + Control_Header_SIZE)) {
             Log_debug(ctx->logger, "runt error packet");
-            return Error_NONE;
+            return NULL;
         }
 
         ctx->error = Message_pop32(msg, NULL);
@@ -148,13 +148,13 @@ static uint8_t receiveMessage(struct Message* msg, struct Interface* iface)
 
         Log_debug(ctx->logger, "error [%s] was caused by our [%s]",
                   Error_strerror(ctx->error),
-                  Control_typeString(origCtrl->type_be));
+                  Control_typeString(origCtrl->header.type_be));
 
         int shift;
-        if (origCtrl->type_be == Control_PING_be) {
-            shift = -(Control_HEADER_SIZE + Control_Ping_HEADER_SIZE);
-        } else if (origCtrl->type_be == Control_KEYPING_be) {
-            shift = -(Control_HEADER_SIZE + Control_KeyPing_HEADER_SIZE);
+        if (origCtrl->header.type_be == Control_PING_be) {
+            shift = -(Control_Header_SIZE + Control_Ping_HEADER_SIZE);
+        } else if (origCtrl->header.type_be == Control_KEYPING_be) {
+            shift = -(Control_Header_SIZE + Control_KeyPing_HEADER_SIZE);
         } else {
             Assert_failure("problem in Ducttape.c");
         }
@@ -171,7 +171,7 @@ static uint8_t receiveMessage(struct Message* msg, struct Interface* iface)
     String* msgStr = &(String) { .bytes = (char*) msg->bytes, .len = msg->length };
     Pinger_pongReceived(msgStr, ctx->pinger);
     Bits_memset(ctx->incomingKey, 0, 32);
-    return Error_NONE;
+    return NULL;
 }
 
 static void onPingResponse(String* data, uint32_t milliseconds, void* vping)
@@ -202,7 +202,7 @@ static void onPingResponse(String* data, uint32_t milliseconds, void* vping)
     resp->data = data;
     resp->milliseconds = milliseconds;
     resp->version = version;
-    Bits_memcpyConst(resp->key, p->context->incomingKey, 32);
+    Bits_memcpy(resp->key, p->context->incomingKey, 32);
     resp->ping = &p->pub;
     p->onResponse(resp, p->pub.onResponseContext);
 }
@@ -226,7 +226,7 @@ static void sendPing(String* data, void* sendPingContext)
         struct Control_KeyPing* keyPingHeader = (struct Control_KeyPing*) msg->bytes;
         keyPingHeader->magic = Control_KeyPing_MAGIC;
         keyPingHeader->version_be = Endian_hostToBigEndian32(Version_CURRENT_PROTOCOL);
-        Bits_memcpyConst(keyPingHeader->key, p->context->myAddr->key, 32);
+        Bits_memcpy(keyPingHeader->key, p->context->myAddr->key, 32);
     } else {
         Message_shift(msg, Control_Ping_HEADER_SIZE, NULL);
         struct Control_Ping* pingHeader = (struct Control_Ping*) msg->bytes;
@@ -234,11 +234,11 @@ static void sendPing(String* data, void* sendPingContext)
         pingHeader->version_be = Endian_hostToBigEndian32(Version_CURRENT_PROTOCOL);
     }
 
-    Message_shift(msg, Control_HEADER_SIZE, NULL);
+    Message_shift(msg, Control_Header_SIZE, NULL);
     struct Control* ctrl = (struct Control*) msg->bytes;
-    ctrl->checksum_be = 0;
-    ctrl->type_be = (p->pub.keyPing) ? Control_KEYPING_be : Control_PING_be;
-    ctrl->checksum_be = Checksum_engine(msg->bytes, msg->length);
+    ctrl->header.checksum_be = 0;
+    ctrl->header.type_be = (p->pub.keyPing) ? Control_KEYPING_be : Control_PING_be;
+    ctrl->header.checksum_be = Checksum_engine(msg->bytes, msg->length);
 
     #ifdef Version_7_COMPAT
         if (0) {
@@ -261,7 +261,7 @@ static void sendPing(String* data, void* sendPingContext)
         SwitchHeader_setVersion(switchHeader, 0);
     #endif
 
-    p->context->iface->sendMessage(msg, p->context->iface);
+    Iface_send(&p->context->pub.controlHandlerIf, msg);
 }
 
 static String* RESULT_STRING_OK =             String_CONST_SO("pong");
@@ -301,7 +301,7 @@ String* SwitchPinger_resultString(enum SwitchPinger_Result result)
 static int onPingFree(struct Allocator_OnFreeJob* job)
 {
     struct Ping* ping = Identity_check((struct Ping*)job->userData);
-    struct SwitchPinger* ctx = Identity_check(ping->context);
+    struct SwitchPinger_pvt* ctx = Identity_check(ping->context);
     ctx->outstandingPings--;
     Assert_true(ctx->outstandingPings >= 0);
     return 0;
@@ -312,8 +312,9 @@ struct SwitchPinger_Ping* SwitchPinger_newPing(uint64_t label,
                                                uint32_t timeoutMilliseconds,
                                                SwitchPinger_ResponseCallback onResponse,
                                                struct Allocator* alloc,
-                                               struct SwitchPinger* ctx)
+                                               struct SwitchPinger* context)
 {
+    struct SwitchPinger_pvt* ctx = Identity_check((struct SwitchPinger_pvt*)context);
     if (data && data->len > Control_Ping_MAX_SIZE) {
         return NULL;
     }
@@ -345,24 +346,26 @@ struct SwitchPinger_Ping* SwitchPinger_newPing(uint64_t label,
     return &ping->pub;
 }
 
-struct SwitchPinger* SwitchPinger_new(struct Interface* iface,
-                                      struct EventBase* eventBase,
+struct SwitchPinger* SwitchPinger_new(struct EventBase* eventBase,
                                       struct Random* rand,
                                       struct Log* logger,
                                       struct Address* myAddr,
-                                      struct Allocator* alloc)
+                                      struct Allocator* allocator)
 {
-    struct SwitchPinger* sp = Allocator_malloc(alloc, sizeof(struct SwitchPinger));
-    Bits_memcpyConst(sp, (&(struct SwitchPinger) {
-        .iface = iface,
+    struct Allocator* alloc = Allocator_child(allocator);
+    struct SwitchPinger_pvt* sp = Allocator_malloc(alloc, sizeof(struct SwitchPinger_pvt));
+    Bits_memcpy(sp, (&(struct SwitchPinger_pvt) {
+        .pub = {
+            .controlHandlerIf = {
+                .send = messageFromControlHandler
+            }
+        },
         .pinger = Pinger_new(eventBase, rand, logger, alloc),
         .logger = logger,
         .allocator = alloc,
         .myAddr = myAddr,
         .maxConcurrentPings = SwitchPinger_DEFAULT_MAX_CONCURRENT_PINGS,
-    }), sizeof(struct SwitchPinger));
-    iface->receiveMessage = receiveMessage;
-    iface->receiverContext = sp;
+    }), sizeof(struct SwitchPinger_pvt));
     Identity_set(sp);
-    return sp;
+    return &sp->pub;
 }

@@ -19,6 +19,7 @@
 #include "util/CString.h"
 #include "util/Bits.h"
 #include "util/Hex.h"
+#include "util/Hash.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,7 +70,7 @@ const struct Sockaddr* const Sockaddr_LOOPBACK6 =
 
 struct Sockaddr* Sockaddr_fromNative(const void* ss, int addrLen, struct Allocator* alloc)
 {
-    struct Sockaddr_pvt* out = Allocator_malloc(alloc, addrLen + Sockaddr_OVERHEAD);
+    struct Sockaddr_pvt* out = Allocator_calloc(alloc, addrLen + Sockaddr_OVERHEAD, 1);
     Bits_memcpy(&out->ss, ss, addrLen);
     out->pub.addrLen = addrLen + Sockaddr_OVERHEAD;
     Sockaddr_normalizeNative(&out->ss);
@@ -192,7 +193,7 @@ char* Sockaddr_print(struct Sockaddr* sockaddr, struct Allocator* alloc)
 
     if (port) {
         int totalLength = CString_strlen(printedAddr) + CString_strlen("[]:65535") + 1;
-        char* out = Allocator_malloc(alloc, totalLength);
+        char* out = Allocator_calloc(alloc, totalLength, 1);
         const char* format = (addr->ss.ss_family == AF_INET6) ? "[%s]:%u" : "%s:%u";
         snprintf(out, totalLength, format, printedAddr, port);
         return out;
@@ -272,20 +273,20 @@ struct Sockaddr* Sockaddr_fromBytes(const uint8_t* bytes, int addrFamily, struct
     switch (addrFamily) {
         case AF_INET: {
             ss.ss_family = AF_INET;
-            Bits_memcpyConst(&((struct sockaddr_in*)&ss)->sin_addr, bytes, 4);
+            Bits_memcpy(&((struct sockaddr_in*)&ss)->sin_addr, bytes, 4);
             addrLen = sizeof(struct sockaddr_in);
             break;
         }
         case AF_INET6: {
             ss.ss_family = AF_INET6;
-            Bits_memcpyConst(&((struct sockaddr_in6*)&ss)->sin6_addr, bytes, 16);
+            Bits_memcpy(&((struct sockaddr_in6*)&ss)->sin6_addr, bytes, 16);
             addrLen = sizeof(struct sockaddr_in6);
             break;
         }
-        default: return NULL;
+        default: Assert_failure("unrecognized address type [%d]", addrFamily);
     }
 
-    struct Sockaddr_pvt* out = Allocator_malloc(alloc, addrLen + Sockaddr_OVERHEAD);
+    struct Sockaddr_pvt* out = Allocator_calloc(alloc, addrLen + Sockaddr_OVERHEAD, 1);
     Bits_memcpy(&out->ss, &ss, addrLen);
     out->pub.addrLen = addrLen + Sockaddr_OVERHEAD;
     return &out->pub;
@@ -308,4 +309,14 @@ struct Sockaddr* Sockaddr_fromName(char* name, struct Allocator* alloc)
         return adr;
     }
     return NULL;
+}
+
+uint32_t Sockaddr_hash(const struct Sockaddr* addr)
+{
+    return Hash_compute((uint8_t*)addr, addr->addrLen);
+}
+
+int Sockaddr_compare(const struct Sockaddr* a, const struct Sockaddr* b)
+{
+    return Bits_memcmp(a, b, a->addrLen);
 }

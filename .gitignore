@@ -1,3 +1,4 @@
+/build_android
 /build_linux
 /build_freebsd
 /build_openbsd
@@ -21,3 +22,4 @@
 .DS_Store
 /node_modules/jshint
 /node_modules/.bin
+/contrib/docker/cjdns*/

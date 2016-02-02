@@ -14,10 +14,9 @@
  */
 #include "memory/Allocator.h"
 #include "memory/MallocAllocator.h"
-#include "io/FileWriter.h"
 #include "interface/tuntap/TUNMessageType.h"
 #include "util/log/Log.h"
-#include "util/log/WriterLog.h"
+#include "util/log/FileWriterLog.h"
 #include "util/events/EventBase.h"
 #include "crypto/random/Random.h"
 #include "crypto/AddressCalc.h"
@@ -25,6 +24,7 @@
 #include "util/Bits.h"
 #include "util/Checksum.h"
 #include "util/CString.h"
+#include "wire/DataHeader.h"
 #include "wire/Message.h"
 #include "wire/Headers.h"
 #include "wire/Ethernet.h"
@@ -34,13 +34,13 @@ static uint8_t nodeCjdnsIp6[16];
 static uint8_t* fakeIp6ToGive = (uint8_t*) "\xfd\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1";
 static int called = 0;
 
-static uint8_t responseWithIpCallback(struct Message* message, struct Interface* iface)
+static Iface_DEFUN responseWithIpCallback(struct Message* message, struct Iface* iface)
 {
-    struct IpTunnel_PacketInfoHeader* pi = (struct IpTunnel_PacketInfoHeader*) message->bytes;
-    Assert_true(!Bits_memcmp(nodeCjdnsIp6, pi->nodeIp6Addr, 16));
-    Assert_true(!Bits_memcmp(fakePubKey, pi->nodeKey, 32));
+    struct RouteHeader* rh = (struct RouteHeader*) message->bytes;
+    Assert_true(!Bits_memcmp(nodeCjdnsIp6, rh->ip6, 16));
+    Assert_true(!Bits_memcmp(fakePubKey, rh->publicKey, 32));
 
-    Message_shift(message, -IpTunnel_PacketInfoHeader_SIZE, NULL);
+    Message_shift(message, -(RouteHeader_SIZE + DataHeader_SIZE), NULL);
     struct Headers_IP6Header* ip = (struct Headers_IP6Header*) message->bytes;
     Assert_true(Headers_getIpVersion(ip) == 6);
     uint16_t length = Endian_bigEndianToHost16(ip->payloadLength_be);
@@ -64,17 +64,17 @@ static uint8_t responseWithIpCallback(struct Message* message, struct Interface*
     char* expectedResponse =
         "9:addresses" "d"
             "3:ip6" "16:\xfd\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1"
-            "9:ip6Prefix" "i0e"
+            "9:ip6Prefix" "i128e"
           "e"
           "4:txid" "4:abcd"
         "e";
     Assert_true(message->length >= (int32_t) CString_strlen(expectedResponse));
     Assert_true(CString_strstr(message->bytes, expectedResponse));
-    called = 2;
+    called |= 2;
     return 0;
 }
 
-static uint8_t messageToTun(struct Message* message, struct Interface* iface)
+static Iface_DEFUN messageToTun(struct Message* message, struct Iface* iface)
 {
     Assert_true(TUNMessageType_pop(message, NULL) == Ethernet_TYPE_IP6);
     struct Headers_IP6Header* ip = (struct Headers_IP6Header*) message->bytes;
@@ -83,7 +83,7 @@ static uint8_t messageToTun(struct Message* message, struct Interface* iface)
     Assert_true(length + Headers_IP6Header_SIZE == message->length);
     Assert_true(ip->nextHeader == 17);
     Assert_true(!Bits_memcmp(ip->sourceAddr, fakeIp6ToGive, 16));
-    called = 1;
+    called |= 1;
     return 0;
 }
 
@@ -91,12 +91,11 @@ int main()
 {
     AddressCalc_addressForPublicKey(nodeCjdnsIp6, fakePubKey);
     struct Allocator* alloc = MallocAllocator_new(1<<20);
-    struct Writer* w = FileWriter_new(stdout, alloc);
-    struct Log* logger = WriterLog_new(w, alloc);
+    struct Log* logger = FileWriterLog_new(stdout, alloc);
     struct Random* rand = Random_new(alloc, logger, NULL);
     struct EventBase* eb = EventBase_new(alloc);
 
-    struct IpTunnel* ipTun = IpTunnel_new(logger, eb, alloc, rand, NULL);
+    struct IpTunnel* ipTun = IpTunnel_new(logger, eb, alloc, rand);
     struct Sockaddr_storage ip6ToGive;
     Sockaddr_parse("fd01:0101:0101:0101:0101:0101:0101:0101", &ip6ToGive);
     IpTunnel_allowConnection(fakePubKey, &ip6ToGive.addr, 0, NULL, 0, ipTun);
@@ -134,19 +133,26 @@ int main()
     Bits_memset(ip->sourceAddr, 0, 32);
     Headers_setIpVersion(ip);
 
-    Message_shift(message, IpTunnel_PacketInfoHeader_SIZE, NULL);
-    struct IpTunnel_PacketInfoHeader* pi = (struct IpTunnel_PacketInfoHeader*) message->bytes;
+    Message_shift(message, RouteHeader_SIZE + DataHeader_SIZE, NULL);
+    struct RouteHeader* rh = (struct RouteHeader*) message->bytes;
+    struct DataHeader* dh = (struct DataHeader*) &rh[1];
 
-    Bits_memcpyConst(pi->nodeIp6Addr, nodeCjdnsIp6, 16);
-    Bits_memcpyConst(pi->nodeKey, fakePubKey, 32);
+    Bits_memset(rh, 0, RouteHeader_SIZE + DataHeader_SIZE);
+    Bits_memcpy(rh->ip6, nodeCjdnsIp6, 16);
+    Bits_memcpy(rh->publicKey, fakePubKey, 32);
+    DataHeader_setContentType(dh, ContentType_IPTUN);
 
     *checksum = Checksum_udpIp6(ip->sourceAddr, (uint8_t*) uh, length);
 
     int origCap = message->capacity;
     int origLen = message->length;
 
-    ipTun->nodeInterface.receiveMessage = responseWithIpCallback;
-    ipTun->nodeInterface.sendMessage(message, &ipTun->nodeInterface);
+    struct Iface nodeIface = { .send = responseWithIpCallback };
+    Iface_plumb(&nodeIface, &ipTun->nodeInterface);
+    struct Iface tunIface = { .send = messageToTun };
+    Iface_plumb(&tunIface, &ipTun->tunInterface);
+
+    Iface_send(&nodeIface, message);
     Assert_true(called == 2);
     called = 0;
 
@@ -155,12 +161,11 @@ int main()
     Message_shift(message, origCap, NULL);
     message->length = origLen;
 
-    Bits_memcpyConst(ip->sourceAddr, fakeIp6ToGive, 16);
+    Bits_memcpy(ip->sourceAddr, fakeIp6ToGive, 16);
     // This can't be zero.
     Bits_memset(ip->destinationAddr, 1, 16);
 
-    ipTun->tunInterface.receiveMessage = messageToTun;
-    ipTun->nodeInterface.sendMessage(message, &ipTun->nodeInterface);
+    Iface_send(&nodeIface, message);
     Assert_true(called == 1);
 
     Allocator_free(alloc);

@@ -18,11 +18,11 @@
 #include "benc/String.h"
 #include "dht/Address.h"
 #include "crypto/random/Random.h"
-#include "interface/Interface.h"
+#include "interface/Iface.h"
 #include "util/events/EventBase.h"
 #include "util/log/Log.h"
 #include "util/Linker.h"
-Linker_require("net/SwitchPinger.c")
+Linker_require("net/SwitchPinger.c");
 
 #include <stdint.h>
 
@@ -95,7 +95,10 @@ struct SwitchPinger_Ping
     void* onResponseContext;
 };
 
-struct SwitchPinger;
+struct SwitchPinger
+{
+    struct Iface controlHandlerIf;
+};
 
 String* SwitchPinger_resultString(enum SwitchPinger_Result result);
 
@@ -117,8 +120,7 @@ struct SwitchPinger_Ping* SwitchPinger_newPing(uint64_t label,
                                                struct Allocator* alloc,
                                                struct SwitchPinger* ctx);
 
-struct SwitchPinger* SwitchPinger_new(struct Interface* iface,
-                                      struct EventBase* eventBase,
+struct SwitchPinger* SwitchPinger_new(struct EventBase* eventBase,
                                       struct Random* rand,
                                       struct Log* logger,
                                       struct Address* myAddr,

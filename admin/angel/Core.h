@@ -15,17 +15,18 @@
 #ifndef Core_H
 #define Core_H
 
+#include "admin/Admin.h"
 #include "benc/String.h"
 #include "exception/Except.h"
 #include "memory/Allocator.h"
-#include "net/Ducttape.h"
+#include "tunnel/IpTunnel.h"
+#include "util/events/FakeNetwork.h"
 #include "util/Linker.h"
-Linker_require("admin/angel/Core.c")
+Linker_require("admin/angel/Core.c");
 
 void Core_initTunnel(String* desiredDeviceName,
                      struct Sockaddr* addr,
                      uint8_t addressPrefix,
-                     struct Ducttape* dt,
                      struct Log* logger,
                      struct IpTunnel* ipTunnel,
                      struct EventBase* eventBase,
@@ -35,9 +36,12 @@ void Core_initTunnel(String* desiredDeviceName,
 void Core_init(struct Allocator* alloc,
                struct Log* logger,
                struct EventBase* eventBase,
-               struct Interface* angelIface,
+               uint8_t privateKey[32],
+               struct Admin* admin,
                struct Random* rand,
-               struct Except* eh);
+               struct Except* eh,
+               struct FakeNetwork* fakeNet,
+               bool noSec);
 
 int Core_main(int argc, char** argv);
 

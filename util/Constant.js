@@ -78,6 +78,26 @@ var randHexString = module.exports.randHexString = function (lenStr) {
     return '"' + hex.substring(0,len) + '"';
 };
 
+var log2 = module.exports.log2 = function (val) {
+    var x = 1;
+    for (var i = 0; i < 31; i++) {
+        if (x === val) {
+            if ((1 << i) !== val) { throw new Error(); }
+            return i;
+        }
+        x = x + x;
+    }
+    throw new Error("not an even power of 2");
+};
+
+var stringForHex = module.exports.stringForHex = function (hex) {
+    var out = [];
+    for (var i = 0; i < hex.length; i+=2) {
+        out.push(hex[i] + hex[i+1]);
+    }
+    if (out.length < 2) { throw new Error(); }
+    return '"\\x' + out.join('\\x') + '"';
+};
 
 if (!module.parent) {
     console.log("testing " + __filename);

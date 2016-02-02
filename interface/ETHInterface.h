@@ -15,20 +15,21 @@
 #ifndef ETHInterface_H
 #define ETHInterface_H
 
+#include "interface/addressable/AddrIface.h"
+#include "benc/List.h"
 #include "util/events/EventBase.h"
-#include "interface/Interface.h"
-#include "interface/InterfaceController.h"
+#include "net/InterfaceController.h"
 #include "util/Gcc.h"
 #include "util/Assert.h"
 #include "util/log/Log.h"
 #include "memory/Allocator.h"
 #include "util/Linker.h"
-Linker_require("interface/ETHInterface_" + builder.config.systemName + ".c")
+Linker_require("interface/ETHInterface_" + builder.config.systemName + ".c");
 
 Gcc_PACKED
 struct ETHInterface_Header
 {
-    /** The version number of the sending node, modulo 256 */
+    /** ETHInterface_CURRENT_VERSION, no communication is possible with different versions. */
     uint8_t version;
 
     /** padding and for future use. */
@@ -43,60 +44,33 @@ struct ETHInterface_Header
 #define ETHInterface_Header_SIZE 6
 Assert_compileTime(sizeof(struct ETHInterface_Header) == ETHInterface_Header_SIZE);
 
-struct ETHInterface;
+/** The content of a Sockaddr emitted from ETHInterface. */
+struct ETHInterface_Sockaddr
+{
+    struct Sockaddr generic;
+    /*
+     * We need to make the first byte following the Sockaddr be 0 because
+     * Sockaddr_normalizeNative will zero it.
+     */
+    uint16_t zero;
+    uint8_t mac[6];
+};
+#define ETHInterface_Sockaddr_SIZE 16
+Assert_compileTime(sizeof(struct ETHInterface_Sockaddr) == ETHInterface_Sockaddr_SIZE);
 
-/**
- * @param base the LibEvent context.
- * @param bindDevice the name of the device to bind to.
- * @param allocator the memory allocator for this message.
- * @param exHandler the handler to deal with whatever exception arises.
- * @param logger
- * @param ic the controller which this interface should register with
- *           and use when starting connections.
- * @return a new ETHInterface.
- */
-struct ETHInterface* ETHInterface_new(struct EventBase* base,
+#define ETHInterface_CURRENT_VERSION 0
+
+struct ETHInterface
+{
+    struct AddrIface generic;
+};
+
+struct ETHInterface* ETHInterface_new(struct EventBase* eventBase,
                                       const char* bindDevice,
-                                      struct Allocator* allocator,
+                                      struct Allocator* alloc,
                                       struct Except* exHandler,
-                                      struct Log* logger,
-                                      struct InterfaceController* ic);
+                                      struct Log* logger);
 
-
-/**
- * Begin an outgoing connection.
- *
- * @param macAddress the MAC address of the ethernet card to connect to.
- * @param cryptoKey the node's public key, this is required to send it traffic.
- * @param password if specified, the password for authenticating with the other node.
- * @param ethIf the Ether interface.
- * @return 0 on success
- *     ETHInterface_beginConnection_OUT_OF_SPACE if there is no space to store the entry.
- *     ETHInterface_beginConnection_BAD_KEY invalid (non-cjdns) cryptoKey
- *     ETHInterface_beginConnection_BAD_IFACE failed to parse interface name.
- *     ETHInterface_beginConnection_UNKNOWN_ERROR something failed in InterfaceController.
- *     ETHInterface_beginConnection_BAD_MAC malformed MAC address.
- */
-#define ETHInterface_beginConnection_OUT_OF_SPACE -1
-#define ETHInterface_beginConnection_BAD_KEY -2
-#define ETHInterface_beginConnection_BAD_IFACE -3
-#define ETHInterface_beginConnection_UNKNOWN_ERROR -4
-#define ETHInterface_beginConnection_BAD_MAC -5
-int ETHInterface_beginConnection(const char* macAddress,
-                                 uint8_t cryptoKey[32],
-                                 String* password,
-                                 struct ETHInterface* ethIf);
-
-/**
- * Get or set the beaconing state of the ethernet interface.
- *
- * @param ethIf the ethernet iface.
- * @param state if not NULL, the state will be set to this, if NULL then nothing will be changed.
- * @return the current state after (possibly) setting.
- */
-#define ETHInterface_beacon_DISABLED 0
-#define ETHInterface_beacon_ACCEPTING 1
-#define ETHInterface_beacon_ACCEPTING_AND_SENDING 2
-int ETHInterface_beacon(struct ETHInterface* ethIf, int* state);
+List* ETHInterface_listDevices(struct Allocator* alloc, struct Except* eh);
 
 #endif

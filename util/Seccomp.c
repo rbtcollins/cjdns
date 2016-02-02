@@ -19,6 +19,7 @@
 #include "util/Seccomp.h"
 #include "util/Bits.h"
 #include "util/ArchInfo.h"
+#include "util/Defined.h"
 
 // getpriority()
 #include <sys/resource.h>
@@ -28,15 +29,44 @@
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <linux/audit.h>
+#include <linux/netlink.h>
 #include <sys/syscall.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
+/**
+ * A unique number which is returned as errno by getpriority(), a syscall we never use
+ * this will be used by Seccomp_isWorking() to detect that the filter has been properly installed.
+ */
+#define IS_WORKING_ERRNO 3333
+
+/**
+ * Accessing the SIGSYS siginfo depends on the fields being defined by the libc.
+ * Older libc do not yet include the needed definitions and accessor macros.
+ * Work around that by falling back to si_value.sival_int which works on some
+ * but not all architectures.
+ */
+#if defined(si_syscall)
+# define GET_SYSCALL_NUM(si) ((si)->si_syscall)
+#else
+#pragma message "your libc doesn't define SIGSYS signal info! \
+info about syscall number in case of SECCOMP crash can be invalid"
+# define GET_SYSCALL_NUM(si) ((si)->si_value.sival_int)
+#endif
+
 static void catchViolation(int sig, siginfo_t* si, void* threadContext)
 {
     printf("Attempted banned syscall number [%d] see doc/Seccomp.md for more information\n",
-           si->si_value.sival_int);
+           GET_SYSCALL_NUM(si));
+
+    if (Defined(si_syscall)) {
+        printf("Your libc doesn't define SIGSYS signal info. "
+               "Above information about syscall number can be invalid.\n");
+    }
+
     Assert_failure("Disallowed Syscall");
 }
 
@@ -80,7 +110,7 @@ static struct sock_fprog* compile(struct Filter* input, int inputLen, struct All
     int outI = 0;
     for (int i = 0; i < inputLen; i++) {
         if (input[i].label == 0) {
-            Bits_memcpyConst(&sf[outI++], &input[i].sf, sizeof(struct sock_filter));
+            Bits_memcpy(&sf[outI++], &input[i].sf, sizeof(struct sock_filter));
         }
         Assert_true(outI <= totalOut);
         Assert_true(i != inputLen-1 || outI == totalOut);
@@ -168,16 +198,14 @@ static struct sock_fprog* mkFilter(struct Allocator* alloc, struct Except* eh)
     int fail = 2;
     int unmaskOnly = 3;
     int isworking = 4;
+    int socket = 5;
+    int ioctl_setip = 6;
+    int bind_netlink = 7;
 
-    enum ArchInfo ai = ArchInfo_detect();
-    uint32_t auditArch = ArchInfo_toAuditArch(ai);
-    if (auditArch == UINT32_MAX) {
-        Except_throw(eh, "Could not detect system architecture");
-    }
+    uint32_t auditArch = ArchInfo_getAuditArch();
 
     struct Filter seccompFilter[] = {
 
-        // verify the processor type is the same as what we're setup for.
         LOAD(offsetof(struct seccomp_data, arch)),
         IFNE(auditArch, fail),
 
@@ -207,11 +235,28 @@ static struct sock_fprog* mkFilter(struct Allocator* alloc, struct Except* eh)
 
         // libuv
         IFEQ(__NR_epoll_ctl, success),
-        IFEQ(__NR_epoll_wait, success),
+        #ifdef __NR_epoll_wait
+            IFEQ(__NR_epoll_wait, success),
+        #endif
+        #ifdef __NR_epoll_pwait
+            IFEQ(__NR_epoll_pwait, success),
+        #endif
+
+        // gettimeofday is required on some architectures
+        #ifdef __NR_gettimeofday
+            IFEQ(__NR_gettimeofday, success),
+        #endif
 
         // TUN (and logging)
         IFEQ(__NR_write, success),
         IFEQ(__NR_read, success),
+        // readv and writev are used by some libc (musl)
+        #ifdef __NR_readv
+            IFEQ(__NR_readv, success),
+        #endif
+        #ifdef __NR_writev
+            IFEQ(__NR_writev, success),
+        #endif
 
         // modern librt reads a read-only mapped section of kernel space which contains the time
         // older versions need system calls for getting the time.
@@ -256,12 +301,60 @@ static struct sock_fprog* mkFilter(struct Allocator* alloc, struct Except* eh)
         #ifdef __NR_mmap2
             IFEQ(__NR_mmap2, success),
         #endif
+        IFEQ(__NR_munmap, success),
 
         // printf()
         IFEQ(__NR_fstat, success),
+        #ifdef __NR_fstat64
+            IFEQ(__NR_fstat64, success),
+        #endif
 
+        // for setting IP addresses
+        // socketForIfName()
+        // and ETHInterface_listDevices
+        #ifdef __NR_socket
+            IFEQ(__NR_socket, socket),
+        #endif
+        IFEQ(__NR_ioctl, ioctl_setip),
+
+        // Security_checkPermissions
+        IFEQ(__NR_getuid, success),
+        // Security_nofiles
+        IFEQ(__NR_setrlimit, success),
+
+        // for ETHInterface_listDevices (netlinkk)
+        #ifdef __NR_bind
+        IFEQ(__NR_bind, bind_netlink),
+        #endif
+        #ifdef __NR_getsockname
+        IFEQ(__NR_getsockname, success),
+        #endif
         RET(SECCOMP_RET_TRAP),
 
+        LABEL(socket),
+        LOAD(offsetof(struct seccomp_data, args[1])),
+        IFEQ(SOCK_DGRAM, success),
+        LOAD(offsetof(struct seccomp_data, args[0])),
+        IFEQ(AF_NETLINK, success),
+        RET(SECCOMP_RET_TRAP),
+
+        LABEL(ioctl_setip),
+        LOAD(offsetof(struct seccomp_data, args[1])),
+        IFEQ(SIOCGIFINDEX, success),
+        IFEQ(SIOCGIFFLAGS, success),
+        IFEQ(SIOCSIFFLAGS, success),
+        IFEQ(SIOCSIFADDR, success),
+        IFEQ(SIOCSIFNETMASK, success),
+        IFEQ(SIOCSIFMTU, success),
+        RET(SECCOMP_RET_TRAP),
+
+        LABEL(bind_netlink),
+        LOAD(offsetof(struct seccomp_data, args[2])),
+        // Filter NETLINK by size of address.
+        // Most importantly INET and INET6
+        // are differnt.
+        IFEQ(sizeof(struct sockaddr_nl), success),
+        RET(SECCOMP_RET_TRAP),
 
         // We allow sigprocmask to *unmask* signals but we don't allow it to mask them.
         LABEL(unmaskOnly),
@@ -270,7 +363,7 @@ static struct sock_fprog* mkFilter(struct Allocator* alloc, struct Except* eh)
         RET(SECCOMP_RET_TRAP),
 
         LABEL(isworking),
-        RET(RET_ERRNO(9000)),
+        RET(RET_ERRNO(IS_WORKING_ERRNO)),
 
         LABEL(fail),
         RET(SECCOMP_RET_TRAP),
@@ -313,10 +406,12 @@ int Seccomp_isWorking()
     // If seccomp is not working, this will fail setting errno to EINVAL
     long ret = getpriority(1000, 1);
 
+    int err = errno;
+
     // Inside of the kernel, it seems to check whether the errno return is sane
-    // and if it is not, it treates it as a return value, 9000 is very unique so
+    // and if it is not, it treates it as a return value, IS_WORKING_ERRNO (3333) is very unique so
     // we'll check for either case just in case this changes.
-    return (ret == -1 && errno == 9000) || (ret == -9000 && errno == 0);
+    return (ret == -1 && err == IS_WORKING_ERRNO) || (ret == -IS_WORKING_ERRNO && err == 0);
 }
 
 int Seccomp_exists()

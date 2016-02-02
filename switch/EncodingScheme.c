@@ -17,6 +17,7 @@
 #include "memory/Allocator.h"
 #include "switch/EncodingScheme.h"
 #include "util/Bits.h"
+#include "util/Endian.h"
 #include "util/Hex.h"
 
 int EncodingScheme_getFormNum(struct EncodingScheme* scheme, uint64_t routeLabel)
@@ -334,7 +335,7 @@ struct EncodingScheme* EncodingScheme_deserialize(String* data,
 
         outCount += 1;
         forms = Allocator_realloc(alloc, forms, outCount * sizeof(struct EncodingScheme_Form));
-        Bits_memcpyConst(&forms[outCount-1], &next, sizeof(struct EncodingScheme_Form));
+        Bits_memcpy(&forms[outCount-1], &next, sizeof(struct EncodingScheme_Form));
     }
 
     struct EncodingScheme* out = Allocator_clone(alloc, (&(struct EncodingScheme) {
@@ -360,7 +361,7 @@ struct EncodingScheme* EncodingScheme_defineFixedWidthScheme(int bitCount, struc
         .scheme = { .count = 1, .forms = &out->form },
         .form = { .bitCount = bitCount, .prefixLen = 0, .prefix = 0, },
     };
-    Bits_memcpyConst(out, &scheme, sizeof(struct NumberCompress_FixedWidthScheme));
+    Bits_memcpy(out, &scheme, sizeof(struct NumberCompress_FixedWidthScheme));
 
     Assert_true(EncodingScheme_isSane(&out->scheme));
 
@@ -406,4 +407,12 @@ int EncodingScheme_isSelfRoute(struct EncodingScheme* scheme, uint64_t routeLabe
     struct EncodingScheme_Form* currentForm = &scheme->forms[formNum];
 
     return (routeLabel & Bits_maxBits64(currentForm->prefixLen + currentForm->bitCount)) == 1;
+}
+
+int EncodingScheme_isOneHop(struct EncodingScheme* scheme, uint64_t routeLabel)
+{
+    int fn = EncodingScheme_getFormNum(scheme, routeLabel);
+    if (fn == EncodingScheme_getFormNum_INVALID) { return 0; }
+    struct EncodingScheme_Form* form = &scheme->forms[fn];
+    return (Bits_log2x64(routeLabel) == form->prefixLen + form->bitCount);
 }

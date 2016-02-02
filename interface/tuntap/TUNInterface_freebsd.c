@@ -12,8 +12,8 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-#include "exception/Except.h"
 #include "interface/tuntap/TUNInterface.h"
+#include "exception/Except.h"
 #include "interface/tuntap/BSDMessageTypeWrapper.h"
 #include "util/AddrTools.h"
 #include "util/events/Pipe.h"
@@ -38,7 +38,7 @@
 #include <netinet6/in6_var.h>
 #include <netinet6/nd6.h>
 
-struct Interface* TUNInterface_new(const char* interfaceName,
+struct Iface* TUNInterface_new(const char* interfaceName,
                                    char assignedInterfaceName[TUNInterface_IFNAMSIZ],
                                    int isTapMode,
                                    struct EventBase* base,
@@ -46,10 +46,19 @@ struct Interface* TUNInterface_new(const char* interfaceName,
                                    struct Except* eh,
                                    struct Allocator* alloc)
 {
+    char deviceFile[TUNInterface_IFNAMSIZ];
+
     if (isTapMode) { Except_throw(eh, "tap mode not supported on this platform"); }
 
+    // We are on FreeBSD so we just need to read /dev/tunxx to create the tun interface
+    if (interfaceName) {
+        snprintf(deviceFile,TUNInterface_IFNAMSIZ,"/dev/%s",interfaceName);
+    } else {
+        snprintf(deviceFile,TUNInterface_IFNAMSIZ,"%s","/dev/tun");
+    }
+
     // Open the descriptor
-    int tunFd = open("/dev/tun", O_RDWR);
+    int tunFd = open(deviceFile, O_RDWR);
 
     //Get the resulting device name
     const char* assignedDevname;
@@ -59,7 +68,8 @@ struct Interface* TUNInterface_new(const char* interfaceName,
     int ppa = 0;
     for (uint32_t i = 0; i < strlen(assignedDevname); i++) {
         if (isdigit(assignedDevname[i])) {
-            ppa = atoi(assignedDevname);
+            ppa = atoi(assignedDevname+i);
+            break;
         }
     }
 
@@ -90,6 +100,13 @@ struct Interface* TUNInterface_new(const char* interfaceName,
         error = "TUNSIFHEAD";
     }
 
+    // This is not a point-to-point interface
+    int tunsifmode = IFF_BROADCAST;
+    if (ioctl(tunFd,TUNSIFMODE,&tunsifmode) == -1) {
+        error = "TUNSIFMODE";
+    }
+
+
     if (error) {
         int err = errno;
         close(tunFd);
@@ -98,5 +115,7 @@ struct Interface* TUNInterface_new(const char* interfaceName,
 
     struct Pipe* p = Pipe_forFiles(tunFd, tunFd, base, eh, alloc);
 
-    return BSDMessageTypeWrapper_new(&p->iface, logger);
+    struct BSDMessageTypeWrapper* bmtw = BSDMessageTypeWrapper_new(alloc, logger);
+    Iface_plumb(&p->iface, &bmtw->wireSide);
+    return &bmtw->inside;
 }

@@ -15,21 +15,19 @@
 #ifndef NDPServer_H
 #define NDPServer_H
 
-#include "interface/Interface.h"
+#include "interface/Iface.h"
 #include "memory/Allocator.h"
 #include "util/log/Log.h"
 #include "wire/Ethernet.h"
 #include "util/Linker.h"
-Linker_require("interface/tuntap/NDPServer.c")
+Linker_require("interface/tuntap/NDPServer.c");
 
 struct NDPServer
 {
-    struct Interface generic;
-    uint8_t advertisePrefix[16];
-    uint8_t prefixLen;
+    struct Iface internal;
 };
 
-struct NDPServer* NDPServer_new(struct Interface* external,
+struct NDPServer* NDPServer_new(struct Iface* external,
                                 struct Log* log,
                                 uint8_t localMac[Ethernet_ADDRLEN],
                                 struct Allocator* alloc);

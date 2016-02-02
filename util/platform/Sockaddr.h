@@ -18,14 +18,17 @@
 #include "memory/Allocator.h"
 #include "util/Endian.h"
 #include "util/Linker.h"
-Linker_require("util/platform/Sockaddr.c")
+Linker_require("util/platform/Sockaddr.c");
 
 #include <stdint.h>
 
 struct Sockaddr
 {
     /** the length of this sockaddr, this field is included in the length. */
-    int64_t addrLen;
+    uint16_t addrLen;
+    #define Sockaddr_flags_BCAST 1
+    uint16_t flags;
+    uint32_t pad;
 };
 
 /** The number of bytes of space taken for representing the addrLen at the beginning. */
@@ -132,5 +135,15 @@ struct Sockaddr* Sockaddr_clone(const struct Sockaddr* addr, struct Allocator* a
  * Normalize inconsistent native sockaddr implementations
  */
 void Sockaddr_normalizeNative(void* nativeSockaddr);
+
+/**
+ * Get a hash for hashtable lookup.
+ */
+uint32_t Sockaddr_hash(const struct Sockaddr* addr);
+
+/**
+ * Compare two sockaddrs for sorting, comparison does not put them in any specific order.
+ */
+int Sockaddr_compare(const struct Sockaddr* a, const struct Sockaddr* b);
 
 #endif

@@ -15,12 +15,7 @@
 #include "crypto/random/Random.h"
 #include "crypto/CryptoAuth.h"
 #include "crypto/AddressCalc.h"
-#include "dht/ReplyModule.h"
-#include "dht/dhtcore/RouterModule.h"
-#include "dht/dhtcore/SearchRunner.h"
-#include "dht/SerializationModule.h"
-#include "dht/EncodingSchemeModule.h"
-#include "dht/dhtcore/Router_new.h"
+#include "dht/Pathfinder.h"
 #include "io/Writer.h"
 #include "io/FileWriter.h"
 #include "util/log/Log.h"
@@ -31,41 +26,40 @@
 #include "util/log/WriterLog.h"
 #include "util/events/EventBase.h"
 #include "net/SwitchPinger.h"
-#include "interface/InterfaceController.h"
-
-#include "crypto_scalarmult_curve25519.h"
+#include "net/ControlHandler.h"
+#include "net/InterfaceController.h"
+#include "interface/ASynchronizer.h"
+#include "interface/Iface.h"
+#include "tunnel/IpTunnel.h"
+#include "net/EventEmitter.h"
+#include "net/SessionManager.h"
+#include "net/SwitchAdapter.h"
+#include "net/UpperDistributor.h"
+#include "net/TUNAdapter.h"
+#include "wire/Headers.h"
 
 struct TestFramework_Link
 {
-    struct Interface srcIf;
-    struct Interface destIf;
-    struct TestFramework* src;
-    struct TestFramework* dest;
+    struct Iface clientIf;
+    struct Iface serverIf;
+    struct TestFramework* client;
+    struct TestFramework* server;
+    int serverIfNum;
+    int clientIfNum;
     Identity
 };
 
-static uint8_t sendTo(struct Message* msg, struct Interface* iface)
+static Iface_DEFUN sendTo(struct Message* msg,
+                          struct Iface* dest,
+                          struct TestFramework* srcTf,
+                          struct TestFramework* destTf)
 {
-    struct TestFramework_Link* link =
-        Identity_check((struct TestFramework_Link*)iface->senderContext);
-
     Assert_true(!((uintptr_t)msg->bytes % 4) || !"alignment fault");
     Assert_true(!(msg->capacity % 4) || !"length fault");
     Assert_true(((int)msg->capacity >= msg->length) || !"length fault0");
 
-    struct Interface* dest;
-    struct TestFramework* srcTf;
-    if (&link->destIf == iface) {
-        dest = &link->srcIf;
-        srcTf = link->dest;
-    } else if (&link->srcIf == iface) {
-        dest = &link->destIf;
-        srcTf = link->src;
-    } else {
-        Assert_true(false);
-    }
-
-    printf("Transferring message to [%p] - message length [%d]\n", (void*)dest, msg->length);
+    Log_debug(srcTf->logger, "Transferring message to [%p] - message length [%d]\n",
+              (void*)dest, msg->length);
 
     // Store the original message and a copy of the original so they can be compared later.
     srcTf->lastMsgBackup = Message_clone(msg, srcTf->alloc);
@@ -77,8 +71,24 @@ static uint8_t sendTo(struct Message* msg, struct Interface* iface)
     }
 
     // Copy the original and send that to the other end.
-    struct Message* sendMsg = Message_clone(msg, dest->allocator);
-    return dest->receiveMessage(sendMsg, dest);
+    // Can't use Iface_next() when not sending the original msg.
+    struct Message* sendMsg = Message_clone(msg, destTf->alloc);
+    Iface_send(dest, sendMsg);
+    return 0;
+}
+
+static Iface_DEFUN sendClient(struct Message* msg, struct Iface* clientIf)
+{
+    struct TestFramework_Link* link =
+        Identity_containerOf(clientIf, struct TestFramework_Link, clientIf);
+    return sendTo(msg, &link->serverIf, link->client, link->server);
+}
+
+static Iface_DEFUN sendServer(struct Message* msg, struct Iface* serverIf)
+{
+    struct TestFramework_Link* link =
+        Identity_containerOf(serverIf, struct TestFramework_Link, serverIf);
+    return sendTo(msg, &link->clientIf, link->server, link->client);
 }
 
 struct TestFramework* TestFramework_setUp(char* privateKey,
@@ -106,71 +116,24 @@ struct TestFramework* TestFramework_setUp(char* privateKey,
         privateKey = (char*)pks;
     }
 
-    uint8_t* publicKey = Allocator_malloc(allocator, 32);
-    crypto_scalarmult_curve25519_base(publicKey, (uint8_t*)privateKey);
+    struct NetCore* nc = NetCore_new(privateKey, allocator, base, rand, logger);
 
-    struct Address* myAddress = Allocator_calloc(allocator, sizeof(struct Address), 1);
-    Bits_memcpyConst(myAddress->key, publicKey, 32);
-    AddressCalc_addressForPublicKey(myAddress->ip6.bytes, publicKey);
+    struct Pathfinder* pf = Pathfinder_register(allocator, logger, base, rand, NULL);
+    struct ASynchronizer* pfAsync = ASynchronizer_new(allocator, base, logger);
+    Iface_plumb(&pfAsync->ifA, &pf->eventIf);
+    EventEmitter_regPathfinderIface(nc->ee, &pfAsync->ifB);
 
-    struct SwitchCore* switchCore = SwitchCore_new(logger, allocator, base);
-    struct CryptoAuth* ca = CryptoAuth_new(allocator, (uint8_t*)privateKey, base, logger, rand);
-
-    struct DHTModuleRegistry* registry = DHTModuleRegistry_new(allocator);
-    ReplyModule_register(registry, allocator);
-
-    struct RumorMill* rumorMill = RumorMill_new(allocator, myAddress, 64, logger, "");
-
-    struct NodeStore* nodeStore = NodeStore_new(myAddress, allocator, base, logger, rumorMill);
-
-    struct RouterModule* routerModule =
-        RouterModule_register(registry, allocator, publicKey, base, logger, rand, nodeStore);
-
-    struct SearchRunner* searchRunner = SearchRunner_new(nodeStore,
-                                                         logger,
-                                                         base,
-                                                         routerModule,
-                                                         myAddress->ip6.bytes,
-                                                         rumorMill,
-                                                         allocator);
-
-    EncodingSchemeModule_register(registry, logger, allocator);
-
-    SerializationModule_register(registry, logger, allocator);
-
-    struct IpTunnel* ipTun = IpTunnel_new(logger, base, allocator, rand, NULL);
-
-    struct Router* router = Router_new(routerModule, nodeStore, searchRunner, allocator);
-
-    struct Ducttape* dt =
-        Ducttape_register((uint8_t*)privateKey, registry, router,
-                          switchCore, base, allocator, logger, ipTun, rand);
-
-    struct SwitchPinger* sp =
-        SwitchPinger_new(&dt->switchPingerIf, base, rand, logger, myAddress, allocator);
-
-    // Interfaces.
-    struct InterfaceController* ifController =
-        InterfaceController_new(ca, switchCore, router, rumorMill,
-                                logger, base, sp, rand, allocator);
-
-    struct TestFramework* tf = Allocator_clone(allocator, (&(struct TestFramework) {
-        .alloc = allocator,
-        .rand = rand,
-        .eventBase = base,
-        .logger = logger,
-        .switchCore = switchCore,
-        .ducttape = dt,
-        .cryptoAuth = ca,
-        .router = routerModule,
-        .switchPinger = sp,
-        .ifController = ifController,
-        .publicKey = publicKey,
-        .nodeStore = nodeStore,
-        .ip = myAddress->ip6.bytes
-    }));
-
+    struct TestFramework* tf = Allocator_calloc(allocator, sizeof(struct TestFramework), 1);
     Identity_set(tf);
+    tf->alloc = allocator;
+    tf->rand = rand;
+    tf->eventBase = base;
+    tf->logger = logger;
+    tf->nc = nc;
+    tf->tunIf = &nc->tunAdapt->tunIf;
+    tf->publicKey = nc->myAddress->key;
+    tf->ip = nc->myAddress->ip6.bytes;
+    tf->pathfinder = pf;
 
     return tf;
 }
@@ -187,41 +150,53 @@ void TestFramework_assertLastMessageUnaltered(struct TestFramework* tf)
     Assert_true(!Bits_memcmp(a->bytes, b->bytes, a->length));
 }
 
-void TestFramework_linkNodes(struct TestFramework* client, struct TestFramework* server)
+void TestFramework_linkNodes(struct TestFramework* client,
+                             struct TestFramework* server,
+                             bool beacon)
 {
     // ifaceA is the client, ifaceB is the server
     struct TestFramework_Link* link =
         Allocator_calloc(client->alloc, sizeof(struct TestFramework_Link), 1);
-
-    Bits_memcpyConst(link, (&(struct TestFramework_Link) {
-        .srcIf = {
-            .sendMessage = sendTo,
-            .senderContext = link,
-            .allocator = client->alloc
-        },
-        .destIf = {
-            .sendMessage = sendTo,
-            .senderContext = link,
-            .allocator = client->alloc
-        },
-        .src = client,
-        .dest = server
-    }), sizeof(struct TestFramework_Link));
     Identity_set(link);
+    link->clientIf.send = sendClient;
+    link->serverIf.send = sendServer;
+    link->client = client;
+    link->server = server;
 
-    // server knows nothing about the client.
-    InterfaceController_registerPeer(server->ifController, NULL, NULL, true, false, &link->destIf);
+    struct InterfaceController_Iface* clientIci = InterfaceController_newIface(
+        client->nc->ifController, String_CONST("client"), client->alloc);
+    link->clientIfNum = clientIci->ifNum;
+    Iface_plumb(&link->clientIf, &clientIci->addrIf);
 
-    // Except that it has an authorizedPassword added.
-    CryptoAuth_addUser(String_CONST("abcdefg1234"), 1, String_CONST("TEST"), server->cryptoAuth);
+    struct InterfaceController_Iface* serverIci = InterfaceController_newIface(
+        server->nc->ifController, String_CONST("server"), server->alloc);
+    link->serverIfNum = serverIci->ifNum;
+    Iface_plumb(&link->serverIf, &serverIci->addrIf);
 
-    // Client has pubKey and passwd for the server.
-    InterfaceController_registerPeer(client->ifController,
-                                     server->publicKey,
-                                     String_CONST("abcdefg1234"),
-                                     false,
-                                     false,
-                                     &link->srcIf);
+    if (beacon) {
+        int ret = InterfaceController_beaconState(client->nc->ifController,
+                                           link->clientIfNum,
+                                           InterfaceController_beaconState_newState_ACCEPT);
+        Assert_true(!ret);
+
+        ret = InterfaceController_beaconState(server->nc->ifController,
+                                       link->serverIfNum,
+                                       InterfaceController_beaconState_newState_SEND);
+        Assert_true(!ret);
+    } else {
+        // Except that it has an authorizedPassword added.
+        CryptoAuth_addUser(String_CONST("abcdefg123"), String_CONST("TEST"), server->nc->ca);
+
+        // Client has pubKey and passwd for the server.
+        InterfaceController_bootstrapPeer(client->nc->ifController,
+                                   link->clientIfNum,
+                                   server->publicKey,
+                                   Sockaddr_LOOPBACK,
+                                   String_CONST("abcdefg123"),
+                                   NULL,
+                                   NULL,
+                                   client->alloc);
+    }
 }
 
 void TestFramework_craftIPHeader(struct Message* msg, uint8_t srcAddr[16], uint8_t destAddr[16])
@@ -234,7 +209,7 @@ void TestFramework_craftIPHeader(struct Message* msg, uint8_t srcAddr[16], uint8
     ip->payloadLength_be = Endian_hostToBigEndian16(msg->length - Headers_IP6Header_SIZE);
     ip->nextHeader = 123; // made up number
     ip->hopLimit = 255;
-    Bits_memcpyConst(ip->sourceAddr, srcAddr, 16);
-    Bits_memcpyConst(ip->destinationAddr, destAddr, 16);
+    Bits_memcpy(ip->sourceAddr, srcAddr, 16);
+    Bits_memcpy(ip->destinationAddr, destAddr, 16);
     Headers_setIpVersion(ip);
 }

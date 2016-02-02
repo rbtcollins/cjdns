@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python2
 # You may redistribute this program and/or modify it under the terms of
 # the GNU General Public License as published by the Free Software Foundation,
 # either version 3 of the License, or (at your option) any later version.
@@ -11,11 +11,20 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+import os
+import json
+
 from time import sleep
 
 def anonConnect(ip='127.0.0.1', port=11234):
     from cjdnsadmin import connect
-    return connect(ip, int(port), '')
+    path = os.path.expanduser('~/.cjdnsadmin')
+    try:
+        with open(path, 'r') as adminInfo:
+            data = json.load(adminInfo)
+        return connect(data['addr'], data['port'], '')
+    except IOError:
+        return connect(ip, int(port), '')
 
 def connect(ip='127.0.0.1', port=11234, password=''):
     from cjdnsadmin import connectWithAdminInfo
@@ -77,7 +86,7 @@ def streamRoutingTable(cjdns, delay=10):
 
         sleep(delay)
 
-def peerStats(cjdns,up=False,verbose=False):
+def peerStats(cjdns,up=False,verbose=False,human_readable=False):
     from publicToIp6 import PublicToIp6_convert;
 
     allPeers = []
@@ -95,13 +104,19 @@ def peerStats(cjdns,up=False,verbose=False):
         i += 1
 
     if verbose:
-        STAT_FORMAT = '%s\tv%s\t%s\tin %d\tout %d\t%s\tdup %d los %d oor %d'
+        STAT_FORMAT = '%s\tv%s\t%s\tin %s\tout %s\t%s\tdup %d los %d oor %d'
 
         for peer in allPeers:
             ip = PublicToIp6_convert(peer['publicKey'])
-
+			
+            b_in  = peer['bytesIn']
+            b_out = peer['bytesOut']
+            if human_readable:
+				b_in  = sizeof_fmt(b_in)
+				b_out = sizeof_fmt(b_out)
+            
             p = STAT_FORMAT % (ip, peer['version'], peer['switchLabel'],
-                               peer['bytesIn'], peer['bytesOut'], peer['state'],
+                               str(b_in), str(b_out), peer['state'],
                                peer['duplicates'], peer['lostPackets'],
                                peer['receivedOutOfRange'])
 
@@ -110,6 +125,12 @@ def peerStats(cjdns,up=False,verbose=False):
 
             print p
     return allPeers
+
+def sizeof_fmt(num):
+    for x in ['B','KB','MB','GB','TB']:
+        if num < 1024.0:
+            return "%3.1f%s" % (num, x)
+        num /= 1024.0
 
 def parseLabel(route):
     route = route.replace('.','')

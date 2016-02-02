@@ -17,24 +17,19 @@
 
 #include <stdint.h>
 
+int AddressCalc_validAddress(const uint8_t address[16])
+{
+    return address[0] == 0xFC;
+}
+
 int AddressCalc_addressForPublicKey(uint8_t addressOut[16], const uint8_t key[32])
 {
     uint8_t hash[crypto_hash_sha512_BYTES];
     crypto_hash_sha512(hash, key, 32);
     crypto_hash_sha512(hash, hash, crypto_hash_sha512_BYTES);
-    Bits_memcpyConst(addressOut, hash, 16);
-    return hash[0] == 0xFC;
+    if (addressOut) {
+        Bits_memcpy(addressOut, hash, 16);
+    }
+    return AddressCalc_validAddress(addressOut);
 }
 
-int AddressCalc_validKey(const uint8_t key[32])
-{
-    uint8_t hash[crypto_hash_sha512_BYTES];
-    crypto_hash_sha512(hash, key, 32);
-    crypto_hash_sha512(hash, hash, crypto_hash_sha512_BYTES);
-    return hash[0] == 0xFC;
-}
-
-int AddressCalc_validAddress(const uint8_t address[16])
-{
-    return address[0] == 0xFC;
-}

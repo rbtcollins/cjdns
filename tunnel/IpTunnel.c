@@ -12,7 +12,6 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-#include "admin/angel/Hermes.h"
 #include "benc/String.h"
 #include "benc/Dict.h"
 #include "benc/List.h"
@@ -25,14 +24,17 @@
 #include "memory/Allocator.h"
 #include "tunnel/IpTunnel.h"
 #include "crypto/AddressCalc.h"
+#include "util/platform/netdev/NetDev.h"
 #include "util/Checksum.h"
 #include "util/AddrTools.h"
 #include "util/events/EventBase.h"
 #include "util/Identity.h"
 #include "util/events/Timeout.h"
+#include "util/Defined.h"
 #include "wire/Error.h"
 #include "wire/Headers.h"
 #include "wire/Ethernet.h"
+#include "wire/DataHeader.h"
 
 #include <stddef.h>
 
@@ -58,9 +60,6 @@ struct IpTunnel_pvt
     struct Timeout* timeout;
     struct Random* rand;
 
-    /** The angel connector for setting IP addresses. */
-    struct Hermes* hermes;
-
     /** For verifying the integrity of the structure. */
     Identity
 };
@@ -82,7 +81,7 @@ static struct IpTunnel_Connection* newConnection(bool isOutgoing, struct IpTunne
             if (!context->pub.connectionList.connections[i].isOutgoing
                 && conn != &context->pub.connectionList.connections[i + 1])
             {
-                Bits_memcpyConst(conn,
+                Bits_memcpy(conn,
                                  &context->pub.connectionList.connections[i + 1],
                                  sizeof(struct IpTunnel_Connection));
                 conn = &context->pub.connectionList.connections[i + 1];
@@ -106,8 +105,9 @@ static struct IpTunnel_Connection* connectionByPubKey(uint8_t pubKey[32],
                                                       struct IpTunnel_pvt* context)
 {
     for (int i = 0; i < (int)context->pub.connectionList.count; i++) {
-        if (!Bits_memcmp(pubKey, context->pub.connectionList.connections[i].header.nodeKey, 32)) {
-            return &context->pub.connectionList.connections[i];
+        struct IpTunnel_Connection* conn = &context->pub.connectionList.connections[i];
+        if (!Bits_memcmp(pubKey, conn->routeHeader.publicKey, 32)) {
+            return conn;
         }
     }
     return NULL;
@@ -125,8 +125,10 @@ static struct IpTunnel_Connection* connectionByPubKey(uint8_t pubKey[32],
  * @return an connection number which is usable with IpTunnel_remove().
  */
 int IpTunnel_allowConnection(uint8_t publicKeyOfAuthorizedNode[32],
-                             struct Sockaddr* ip6Addr, uint8_t ip6Prefix,
-                             struct Sockaddr* ip4Addr, uint8_t ip4Prefix,
+                             struct Sockaddr* ip6Addr,
+                             uint8_t ip6Prefix,
+                             struct Sockaddr* ip4Addr,
+                             uint8_t ip4Prefix,
                              struct IpTunnel* tunnel)
 {
     struct IpTunnel_pvt* context = Identity_check((struct IpTunnel_pvt*)tunnel);
@@ -143,35 +145,37 @@ int IpTunnel_allowConnection(uint8_t publicKeyOfAuthorizedNode[32],
     }
 
     struct IpTunnel_Connection* conn = newConnection(false, context);
-    Bits_memcpyConst(conn->header.nodeKey, publicKeyOfAuthorizedNode, 32);
-    AddressCalc_addressForPublicKey(conn->header.nodeIp6Addr, publicKeyOfAuthorizedNode);
+    Bits_memcpy(conn->routeHeader.publicKey, publicKeyOfAuthorizedNode, 32);
+    AddressCalc_addressForPublicKey(conn->routeHeader.ip6, publicKeyOfAuthorizedNode);
     if (ip4Address) {
-        Bits_memcpyConst(conn->connectionIp4, ip4Address, 4);
+        Bits_memcpy(conn->connectionIp4, ip4Address, 4);
+        if (!ip4Prefix) { ip4Prefix = 32; }
         conn->connectionIp4Prefix = ip4Prefix;
     }
     if (ip6Address) {
-        Bits_memcpyConst(conn->connectionIp6, ip6Address, 16);
+        Bits_memcpy(conn->connectionIp6, ip6Address, 16);
+        if (!ip6Prefix) { ip6Prefix = 128; }
         conn->connectionIp6Prefix = ip6Prefix;
     }
     return conn->number;
 }
 
-static uint8_t sendToNode(struct Message* message,
-                          struct IpTunnel_Connection* connection,
-                          struct IpTunnel_pvt* context)
+static Iface_DEFUN sendToNode(struct Message* message,
+                              struct IpTunnel_Connection* connection,
+                              struct IpTunnel_pvt* context)
 {
-    Message_push(message, &connection->header, IpTunnel_PacketInfoHeader_SIZE, NULL);
-    if (context->pub.nodeInterface.receiveMessage) {
-        return context->pub.nodeInterface.receiveMessage(message, &context->pub.nodeInterface);
-    }
-    Log_info(context->logger, "Message undeliverable because IpTunnel is not registered");
-    return Error_UNDELIVERABLE;
+    Message_push(message, NULL, DataHeader_SIZE, NULL);
+    struct DataHeader* dh = (struct DataHeader*) message->bytes;
+    DataHeader_setContentType(dh, ContentType_IPTUN);
+    DataHeader_setVersion(dh, DataHeader_CURRENT_VERSION);
+    Message_push(message, &connection->routeHeader, RouteHeader_SIZE, NULL);
+    return Iface_next(&context->pub.nodeInterface, message);
 }
 
-static uint8_t sendControlMessage(Dict* dict,
-                                  struct IpTunnel_Connection* connection,
-                                  struct Allocator* requestAlloc,
-                                  struct IpTunnel_pvt* context)
+static void sendControlMessage(Dict* dict,
+                               struct IpTunnel_Connection* connection,
+                               struct Allocator* requestAlloc,
+                               struct IpTunnel_pvt* context)
 {
     struct Message* msg = Message_new(0, 1024, requestAlloc);
     BencMessageWriter_write(dict, msg, NULL);
@@ -204,18 +208,17 @@ static uint8_t sendControlMessage(Dict* dict,
                                       (uint8_t*) uh,
                                       msg->length - Headers_IP6Header_SIZE);
 
-    return sendToNode(msg, connection, context);
+    Iface_CALL(sendToNode, msg, connection, context);
 }
 
-static uint8_t requestAddresses(struct IpTunnel_Connection* conn,
-                                struct IpTunnel_pvt* context)
+static void requestAddresses(struct IpTunnel_Connection* conn, struct IpTunnel_pvt* context)
 {
-    #ifdef Log_DEBUG
+    if (Defined(Log_DEBUG)) {
         uint8_t addr[40];
-        AddrTools_printIp(addr, conn->header.nodeIp6Addr);
+        AddrTools_printIp(addr, conn->routeHeader.ip6);
         Log_debug(context->logger, "Requesting addresses from [%s] for connection [%d]",
                   addr, conn->number);
-    #endif
+    }
 
     int number = conn->number;
     Dict d = Dict_CONST(
@@ -224,9 +227,8 @@ static uint8_t requestAddresses(struct IpTunnel_Connection* conn,
         NULL
     ));
     struct Allocator* msgAlloc = Allocator_child(context->allocator);
-    uint8_t ret = sendControlMessage(&d, conn, msgAlloc, context);
+    sendControlMessage(&d, conn, msgAlloc, context);
     Allocator_free(msgAlloc);
-    return ret;
 }
 
 /**
@@ -241,14 +243,14 @@ int IpTunnel_connectTo(uint8_t publicKeyOfNodeToConnectTo[32], struct IpTunnel* 
     struct IpTunnel_pvt* context = Identity_check((struct IpTunnel_pvt*)tunnel);
 
     struct IpTunnel_Connection* conn = newConnection(true, context);
-    Bits_memcpyConst(conn->header.nodeKey, publicKeyOfNodeToConnectTo, 32);
-    AddressCalc_addressForPublicKey(conn->header.nodeIp6Addr, publicKeyOfNodeToConnectTo);
+    Bits_memcpy(conn->routeHeader.publicKey, publicKeyOfNodeToConnectTo, 32);
+    AddressCalc_addressForPublicKey(conn->routeHeader.ip6, publicKeyOfNodeToConnectTo);
 
-    #ifdef Log_DEBUG
+    if (Defined(Log_DEBUG)) {
         uint8_t addr[40];
-        AddrTools_printIp(addr, conn->header.nodeIp6Addr);
+        AddrTools_printIp(addr, conn->routeHeader.ip6);
         Log_debug(context->logger, "Trying to connect to [%s]", addr);
-    #endif
+    }
 
     requestAddresses(conn, context);
 
@@ -268,13 +270,13 @@ int IpTunnel_removeConnection(int connectionNumber, struct IpTunnel* tunnel)
     return 0;
 }
 
-static uint8_t isControlMessageInvalid(struct Message* message, struct IpTunnel_pvt* context)
+static bool isControlMessageInvalid(struct Message* message, struct IpTunnel_pvt* context)
 {
     struct Headers_IP6Header* header = (struct Headers_IP6Header*) message->bytes;
     uint16_t length = Endian_bigEndianToHost16(header->payloadLength_be);
     if (header->nextHeader != 17 || message->length < length + Headers_IP6Header_SIZE) {
         Log_warn(context->logger, "Invalid IPv6 packet (not UDP or length field too big)");
-        return Error_INVALID;
+        return true;
     }
 
     Message_shift(message, -Headers_IP6Header_SIZE, NULL);
@@ -282,7 +284,7 @@ static uint8_t isControlMessageInvalid(struct Message* message, struct IpTunnel_
 
     if (Checksum_udpIp6(header->sourceAddr, message->bytes, length)) {
         Log_warn(context->logger, "Checksum mismatch");
-        return Error_INVALID;
+        return true;
     }
 
     length -= Headers_UDPHeader_SIZE;
@@ -291,29 +293,29 @@ static uint8_t isControlMessageInvalid(struct Message* message, struct IpTunnel_
         || udp->destPort_be != 0)
     {
         Log_warn(context->logger, "Invalid UDP packet (length mismatch or wrong ports)");
-        return Error_INVALID;
+        return true;
     }
 
     Message_shift(message, -Headers_UDPHeader_SIZE, NULL);
 
     message->length = length;
-    return 0;
+    return false;
 }
 
-static uint8_t requestForAddresses(Dict* request,
-                                   struct IpTunnel_Connection* conn,
-                                   struct Allocator* requestAlloc,
-                                   struct IpTunnel_pvt* context)
+static Iface_DEFUN requestForAddresses(Dict* request,
+                                       struct IpTunnel_Connection* conn,
+                                       struct Allocator* requestAlloc,
+                                       struct IpTunnel_pvt* context)
 {
-    #ifdef Log_DEBUG
+    if (Defined(Log_DEBUG)) {
         uint8_t addr[40];
-        AddrTools_printIp(addr, conn->header.nodeIp6Addr);
+        AddrTools_printIp(addr, conn->routeHeader.ip6);
         Log_debug(context->logger, "Got request for addresses from [%s]", addr);
-    #endif
+    }
 
     if (conn->isOutgoing) {
         Log_warn(context->logger, "got request for addresses from outgoing connection");
-        return Error_INVALID;
+        return 0;
     }
     Dict* addresses = Dict_new(requestAlloc);
     bool noAddresses = true;
@@ -350,26 +352,8 @@ static uint8_t requestForAddresses(Dict* request,
         Dict_putString(msg, String_CONST("txid"), txid, requestAlloc);
     }
 
-    return sendControlMessage(msg, conn, requestAlloc, context);
-}
-
-static void addAddressCallback(Dict* responseMessage, void* vcontext)
-{
-    struct IpTunnel_pvt* ctx = Identity_check((struct IpTunnel_pvt*) vcontext);
-    char* err = "invalid response";
-    String* error = Dict_getString(responseMessage, String_CONST("error"));
-    if (error) {
-        err = error->bytes;
-    }
-    if (!error || !String_equals(error, String_CONST("none"))) {
-        Log_error(ctx->logger, "Error setting ip address on TUN [%s]", err);
-
-        #ifndef Log_ERROR
-            // this whole function does essentially nothing but log an error so unused vars.
-            err = err;
-            ctx = ctx;
-        #endif
-    }
+    sendControlMessage(msg, conn, requestAlloc, context);
+    return 0;
 }
 
 static void addAddress(char* printedAddr, uint8_t prefixLen, struct IpTunnel_pvt* ctx)
@@ -378,55 +362,51 @@ static void addAddress(char* printedAddr, uint8_t prefixLen, struct IpTunnel_pvt
         Log_error(ctx->logger, "Failed to set IP address because TUN interface is not setup");
         return;
     }
+    struct Sockaddr_storage ss;
+    if (Sockaddr_parse(printedAddr, &ss)) {
+        Log_error(ctx->logger, "Invalid ip, setting ip address on TUN");
+        return;
+    }
     struct Jmp j;
     Jmp_try(j) {
-        Dict args = Dict_CONST(
-            String_CONST("address"), String_OBJ(String_CONST(printedAddr)), Dict_CONST(
-            String_CONST("interfaceName"), String_OBJ(ctx->ifName), Dict_CONST(
-            String_CONST("prefixLen"), Int_OBJ(prefixLen), NULL
-        )));
-        Dict msg = Dict_CONST(
-            String_CONST("args"), Dict_OBJ(&args), Dict_CONST(
-            String_CONST("q"), String_OBJ(String_CONST("Angel_addIp")), NULL
-        ));
-        Hermes_callAngel(&msg, addAddressCallback, ctx, ctx->allocator, &j.handler, ctx->hermes);
+        NetDev_addAddress(ctx->ifName->bytes, &ss.addr, prefixLen, ctx->logger, &j.handler);
     } Jmp_catch {
         Log_error(ctx->logger, "Error setting ip address on TUN [%s]", j.message);
     }
 }
 
-static int incomingAddresses(Dict* d,
-                             struct IpTunnel_Connection* conn,
-                             struct Allocator* alloc,
-                             struct IpTunnel_pvt* context)
+static Iface_DEFUN incomingAddresses(Dict* d,
+                                     struct IpTunnel_Connection* conn,
+                                     struct Allocator* alloc,
+                                     struct IpTunnel_pvt* context)
 {
     if (!conn->isOutgoing) {
         Log_warn(context->logger, "got offer of addresses from incoming connection");
-        return Error_INVALID;
+        return 0;
     }
 
     String* txid = Dict_getString(d, String_CONST("txid"));
     if (!txid || txid->len != 4) {
         Log_info(context->logger, "missing or wrong length txid");
-        return Error_INVALID;
+        return 0;
     }
 
     int number;
-    Bits_memcpyConst(&number, txid->bytes, 4);
+    Bits_memcpy(&number, txid->bytes, 4);
     if (number < 0 || number >= (int)context->nextConnectionNumber) {
         Log_info(context->logger, "txid out of range");
-        return Error_INVALID;
+        return 0;
     }
 
     if (number != conn->number) {
         for (int i = 0; i < (int)context->pub.connectionList.count; i++) {
             if (context->pub.connectionList.connections[i].number == number) {
-                if (Bits_memcmp(conn->header.nodeKey,
-                                context->pub.connectionList.connections[i].header.nodeKey,
+                if (Bits_memcmp(conn->routeHeader.publicKey,
+                                context->pub.connectionList.connections[i].routeHeader.publicKey,
                                 32))
                 {
                     Log_info(context->logger, "txid doesn't match origin");
-                    return Error_INVALID;
+                    return 0;
                 } else {
                     conn = &context->pub.connectionList.connections[i];
                 }
@@ -439,12 +419,12 @@ static int incomingAddresses(Dict* d,
     String* ip4 = Dict_getString(addresses, String_CONST("ip4"));
     int64_t* ip4Prefix = Dict_getInt(addresses, String_CONST("ip4Prefix"));
     if (ip4 && ip4->len == 4) {
-        Bits_memcpyConst(conn->connectionIp4, ip4->bytes, 4);
+        Bits_memcpy(conn->connectionIp4, ip4->bytes, 4);
 
-        if (ip4Prefix && *ip4Prefix >= 0 && *ip4Prefix <= 32) {
+        if (ip4Prefix && *ip4Prefix > 0 && *ip4Prefix <= 32) {
             conn->connectionIp4Prefix = (uint8_t) *ip4Prefix;
         } else {
-            conn->connectionIp4Prefix = 0;
+            conn->connectionIp4Prefix = 32;
         }
 
         struct Sockaddr* sa = Sockaddr_clone(Sockaddr_LOOPBACK, alloc);
@@ -462,21 +442,19 @@ static int incomingAddresses(Dict* d,
     String* ip6 = Dict_getString(addresses, String_CONST("ip6"));
     int64_t* ip6Prefix = Dict_getInt(addresses, String_CONST("ip6Prefix"));
     if (ip6 && ip6->len == 16) {
-        Bits_memcpyConst(conn->connectionIp6, ip6->bytes, 16);
+        Bits_memcpy(conn->connectionIp6, ip6->bytes, 16);
 
-        if (ip6Prefix && *ip6Prefix >= 0 && *ip6Prefix <= 128) {
+        if (ip6Prefix && *ip6Prefix > 0 && *ip6Prefix <= 128) {
             conn->connectionIp6Prefix = (uint8_t) *ip6Prefix;
         } else {
-            conn->connectionIp6Prefix = 0;
+            conn->connectionIp6Prefix = 128;
         }
 
-        #ifdef Darwin
-            if (conn->connectionIp6Prefix < 3) {
-                // Apple doesn't handle prefix length of 0 properly. 3 covers
-                // all IPv6 unicast space.
-                conn->connectionIp6Prefix = 3;
-            }
-        #endif
+        if (Defined(Darwin) && conn->connectionIp6Prefix < 3) {
+            // Apple doesn't handle prefix length of 0 properly. 3 covers
+            // all IPv6 unicast space.
+            conn->connectionIp6Prefix = 3;
+        }
 
         struct Sockaddr* sa = Sockaddr_clone(Sockaddr_LOOPBACK6, alloc);
         uint8_t* addrBytes = NULL;
@@ -492,27 +470,27 @@ static int incomingAddresses(Dict* d,
     return 0;
 }
 
-static uint8_t incomingControlMessage(struct Message* message,
-                                      struct IpTunnel_Connection* conn,
-                                      struct IpTunnel_pvt* context)
+static Iface_DEFUN incomingControlMessage(struct Message* message,
+                                          struct IpTunnel_Connection* conn,
+                                          struct IpTunnel_pvt* context)
 {
-    #ifdef Log_DEBUG
+    if (Defined(Log_DEBUG)) {
         uint8_t addr[40];
-        AddrTools_printIp(addr, conn->header.nodeIp6Addr);
+        AddrTools_printIp(addr, conn->routeHeader.ip6);
         Log_debug(context->logger, "Got incoming message from [%s]", addr);
-    #endif
+    }
 
     // This aligns the message on the content.
     if (isControlMessageInvalid(message, context)) {
-        return Error_INVALID;
+        return 0;
     }
 
-    #ifdef Log_DEBUG
+    if (Defined(Log_DEBUG)) {
         uint8_t lastChar = message->bytes[message->length - 1];
         message->bytes[message->length - 1] = '\0';
         Log_debug(context->logger, "Message content [%s%c]", message->bytes, lastChar);
         message->bytes[message->length - 1] = lastChar;
-    #endif
+    }
 
     struct Allocator* alloc = Allocator_child(message->alloc);
 
@@ -520,7 +498,7 @@ static uint8_t incomingControlMessage(struct Message* message,
     char* err = BencMessageReader_readNoExcept(message, alloc, &d);
     if (err) {
         Log_info(context->logger, "Failed to parse message [%s]", err);
-        return Error_INVALID;
+        return 0;
     }
 
     if (Dict_getDict(d, String_CONST("addresses"))) {
@@ -532,7 +510,51 @@ static uint8_t incomingControlMessage(struct Message* message,
         return requestForAddresses(d, conn, alloc, context);
     }
     Log_warn(context->logger, "Message which is unhandled");
-    return Error_INVALID;
+    return 0;
+}
+
+#define GET64(buffer) \
+    (__extension__ ({                                               \
+        Assert_true(!((long)(buffer) % 4));                         \
+        uint64_t x = (uint64_t) (((uint32_t*)(buffer))[0]) << 32;   \
+        x |= ((uint32_t*)(buffer))[1];                              \
+        Endian_bigEndianToHost64(x);                                \
+    }))
+
+#define GET32(buffer) \
+    (__extension__ ({                                               \
+        Assert_true(!((long)(buffer) % 4));                         \
+        uint32_t x = (((uint32_t*)(buffer))[0]);                    \
+        Endian_bigEndianToHost32(x);                                \
+    }))
+
+static bool prefixMatches6(uint8_t* addressA, uint8_t* refAddr, uint8_t prefixLen)
+{
+    if (!prefixLen) {
+        Assert_true(Bits_isZero(refAddr, 16));
+        return false;
+    }
+    Assert_true(prefixLen && prefixLen <= 128);
+    uint64_t a0 = GET64(addressA);
+    uint64_t b0 = GET64(refAddr);
+    if (prefixLen <= 64) {
+        return !( (a0 ^ b0) >> (64 - prefixLen) );
+    }
+    uint64_t a1 = GET64(addressA + 8);
+    uint64_t b1 = GET64(refAddr + 8);
+    return !( (a0 ^ b0) | ((a1 ^ b1) >> (128 - prefixLen)) );
+}
+
+static bool prefixMatches4(uint8_t* addressA, uint8_t* refAddr, uint32_t prefixLen)
+{
+    if (!prefixLen) {
+        Assert_true(Bits_isZero(refAddr, 4));
+        return false;
+    }
+    Assert_true(prefixLen && prefixLen <= 32);
+    uint32_t a = GET32(addressA);
+    uint32_t b = GET32(refAddr);
+    return !((a ^ b) >> (32 - prefixLen));
 }
 
 /**
@@ -568,7 +590,7 @@ static struct IpTunnel_Connection* getConnection(struct IpTunnel_Connection* con
     }
 
     struct IpTunnel_Connection* lastConnection =
-        &context->pub.connectionList.connections[context->pub.connectionList.count];
+        &context->pub.connectionList.connections[context->pub.connectionList.count - 1];
 
     do {
         // If this is an incoming message from the w0rld, and we're the client, we want
@@ -583,9 +605,14 @@ static struct IpTunnel_Connection* getConnection(struct IpTunnel_Connection* con
             ? ((conn->isOutgoing) ? source : destination)
             : ((conn->isOutgoing) ? destination : source);
 
-        uint8_t* connectionAddr = (sourceAndDestIp6) ? conn->connectionIp6 : conn->connectionIp4;
-        if (!Bits_memcmp(compareAddr, connectionAddr, length)) {
-            return conn;
+        if (sourceAndDestIp6) {
+            if (prefixMatches6(compareAddr, conn->connectionIp6, conn->connectionIp6Prefix)) {
+                return conn;
+            }
+        } else {
+            if (prefixMatches4(compareAddr, conn->connectionIp4, conn->connectionIp4Prefix)) {
+                return conn;
+            }
         }
         conn++;
     } while (conn <= lastConnection);
@@ -593,7 +620,7 @@ static struct IpTunnel_Connection* getConnection(struct IpTunnel_Connection* con
     return NULL;
 }
 
-static uint8_t incomingFromTun(struct Message* message, struct Interface* tunIf)
+static Iface_DEFUN incomingFromTun(struct Message* message, struct Iface* tunIf)
 {
     struct IpTunnel_pvt* context = Identity_check((struct IpTunnel_pvt*)tunIf);
 
@@ -620,20 +647,20 @@ static uint8_t incomingFromTun(struct Message* message, struct Interface* tunIf)
                              context);
     } else {
         Log_info(context->logger, "Message of unknown type from TUN");
-        return Error_INVALID;
+        return 0;
     }
 
     if (!conn) {
         Log_info(context->logger, "Message with unrecognized address from TUN");
-        return Error_INVALID;
+        return 0;
     }
 
     return sendToNode(message, conn, context);
 }
 
-static uint8_t ip6FromNode(struct Message* message,
-                           struct IpTunnel_Connection* conn,
-                           struct IpTunnel_pvt* context)
+static Iface_DEFUN ip6FromNode(struct Message* message,
+                               struct IpTunnel_Connection* conn,
+                               struct IpTunnel_pvt* context)
 {
     struct Headers_IP6Header* header = (struct Headers_IP6Header*) message->bytes;
     if (Bits_isZero(header->sourceAddr, 16) || Bits_isZero(header->destinationAddr, 16)) {
@@ -641,66 +668,56 @@ static uint8_t ip6FromNode(struct Message* message,
             return incomingControlMessage(message, conn, context);
         }
         Log_debug(context->logger, "Got message with zero address");
-        return Error_INVALID;
+        return 0;
     }
     if (!getConnection(conn, header->sourceAddr, NULL, false, context)) {
         Log_debug(context->logger, "Got message with wrong address for connection");
-        return Error_INVALID;
+        return 0;
     }
 
     TUNMessageType_push(message, Ethernet_TYPE_IP6, NULL);
-
-    struct Interface* tunIf = &context->pub.tunInterface;
-    if (tunIf->receiveMessage) {
-        tunIf->receiveMessage(message, tunIf);
-    }
-    return 0;
+    return Iface_next(&context->pub.tunInterface, message);
 }
 
-static uint8_t ip4FromNode(struct Message* message,
-                           struct IpTunnel_Connection* conn,
-                           struct IpTunnel_pvt* context)
+static Iface_DEFUN ip4FromNode(struct Message* message,
+                               struct IpTunnel_Connection* conn,
+                               struct IpTunnel_pvt* context)
 {
     struct Headers_IP4Header* header = (struct Headers_IP4Header*) message->bytes;
     if (Bits_isZero(header->sourceAddr, 4) || Bits_isZero(header->destAddr, 4)) {
         Log_debug(context->logger, "Got message with zero address");
-        return Error_INVALID;
-    }
-    if (!getConnection(conn, NULL, header->sourceAddr, false, context)) {
+        return 0;
+    } else if (!getConnection(conn, NULL, header->sourceAddr, false, context)) {
         Log_debug(context->logger, "Got message with wrong address for connection");
-        return Error_INVALID;
-    }
-
-    TUNMessageType_push(message, Ethernet_TYPE_IP4, NULL);
-
-    struct Interface* tunIf = &context->pub.tunInterface;
-    if (tunIf->receiveMessage) {
-        return tunIf->receiveMessage(message, tunIf);
-    }
-    return 0;
-}
-
-static uint8_t incomingFromNode(struct Message* message, struct Interface* nodeIf)
-{
-    struct IpTunnel_pvt* context =
-        (struct IpTunnel_pvt*)(((char*)nodeIf) - offsetof(struct IpTunnel, nodeInterface));
-    Identity_check(context);
-
-    //Log_debug(context->logger, "Got incoming message");
-
-    Assert_true(message->length >= IpTunnel_PacketInfoHeader_SIZE);
-    struct IpTunnel_PacketInfoHeader* header = (struct IpTunnel_PacketInfoHeader*) message->bytes;
-    struct IpTunnel_Connection* conn = connectionByPubKey(header->nodeKey, context);
-    if (!conn) {
-        #ifdef Log_DEBUG
-            uint8_t addr[40];
-            AddrTools_printIp(addr, header->nodeIp6Addr);
-            Log_debug(context->logger, "Got message from unrecognized node [%s]", addr);
-        #endif
         return 0;
     }
 
-    Message_shift(message, -IpTunnel_PacketInfoHeader_SIZE, NULL);
+    TUNMessageType_push(message, Ethernet_TYPE_IP4, NULL);
+    return Iface_next(&context->pub.tunInterface, message);
+}
+
+static Iface_DEFUN incomingFromNode(struct Message* message, struct Iface* nodeIf)
+{
+    struct IpTunnel_pvt* context =
+        Identity_containerOf(nodeIf, struct IpTunnel_pvt, pub.nodeInterface);
+
+    //Log_debug(context->logger, "Got incoming message");
+
+    Assert_true(message->length >= RouteHeader_SIZE + DataHeader_SIZE);
+    struct RouteHeader* rh = (struct RouteHeader*) message->bytes;
+    struct DataHeader* dh = (struct DataHeader*) &rh[1];
+    Assert_true(DataHeader_getContentType(dh) == ContentType_IPTUN);
+    struct IpTunnel_Connection* conn = connectionByPubKey(rh->publicKey, context);
+    if (!conn) {
+        if (Defined(Log_DEBUG)) {
+            uint8_t addr[40];
+            AddrTools_printIp(addr, rh->ip6);
+            Log_debug(context->logger, "Got message from unrecognized node [%s]", addr);
+        }
+        return 0;
+    }
+
+    Message_shift(message, -(RouteHeader_SIZE + DataHeader_SIZE), NULL);
 
     if (message->length > 40 && Headers_getIpVersion(message->bytes) == 6) {
         return ip6FromNode(message, conn, context);
@@ -709,15 +726,15 @@ static uint8_t incomingFromNode(struct Message* message, struct Interface* nodeI
         return ip4FromNode(message, conn, context);
     }
 
-    #ifdef Log_DEBUG
+    if (Defined(Log_DEBUG)) {
         uint8_t addr[40];
-        AddrTools_printIp(addr, header->nodeIp6Addr);
+        AddrTools_printIp(addr, rh->ip6);
         Log_debug(context->logger,
                   "Got message of unknown type, length: [%d], IP version [%d] from [%s]",
                   message->length,
                   (message->length > 1) ? Headers_getIpVersion(message->bytes) : 0,
                   addr);
-    #endif
+    }
     return 0;
 }
 
@@ -754,18 +771,16 @@ void IpTunnel_setTunName(char* interfaceName, struct IpTunnel* ipTun)
 struct IpTunnel* IpTunnel_new(struct Log* logger,
                               struct EventBase* eventBase,
                               struct Allocator* alloc,
-                              struct Random* rand,
-                              struct Hermes* hermes)
+                              struct Random* rand)
 {
     struct IpTunnel_pvt* context = Allocator_clone(alloc, (&(struct IpTunnel_pvt) {
         .pub = {
-            .tunInterface = { .sendMessage = incomingFromTun },
-            .nodeInterface = { .sendMessage = incomingFromNode }
+            .tunInterface = { .send = incomingFromTun },
+            .nodeInterface = { .send = incomingFromNode }
         },
         .allocator = alloc,
         .logger = logger,
-        .rand = rand,
-        .hermes = hermes
+        .rand = rand
     }));
     context->timeout = Timeout_setInterval(timeout, context, 10000, eventBase, alloc);
     Identity_set(context);

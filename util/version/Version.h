@@ -16,7 +16,7 @@
 #define Version_H
 
 #include "util/Linker.h"
-Linker_require("util/version/Version.c")
+Linker_require("util/version/Version.c");
 
 #include <stdint.h>
 
@@ -295,15 +295,83 @@ Version_COMPAT(13, ([12]))
 Version_COMPAT(14, ([12,13]))
 
 /**
+ * Version 15:
+ * January 29, 2014
+ *
+ * Cerimonial version 15 to indicate a change in routing behavior, for each incoming
+ * packet, remember the path it took, if no path to the return node is known,
+ * use the path that the incoming packet took for the response.
+ */
+Version_COMPAT(15, ([12,13,14]))
+
+/**
+ * Version 16:
+ * February 13, 2014
+ *
+ * Verschlumbesserung
+ *
+ * This version comprises a major refactoring both in the internal organizatin of and the behavior
+ * of cjdns. First on the internal organization note, the file formerly known as Ducttape.c is no
+ * more, it made cjdns when cjdns didn't work but now it's time has passed, long live Ducttape.
+ * Ducttape has been broken up into a series of 5 modules, SwitchAdapter, ControlHandler,
+ * SessionManager, UpperDistributor and TUNAdapter. Furthermore Interface.h has been removed and
+ * replaced with Iface.h. Interface.h was "gendered", meaning the male side of one interface could
+ * only be linked with the female side of the other, Iface is ungendered and is linked (potentially
+ * to any other interface in the project) using Iface_plumb(). Furthermore Iface has been adapted
+ * to facilitate manual tail-call optimization.
+ *
+ * A new protocol called PFChan seperates the Pathfinder from the (packet handling) core. The
+ * pathfinder is nolonger required to answer any questions for the core synchronously and since it
+ * now communicated using Message and Iface as opposed to function calls, it may be seperated into
+ * an external process. Furthermore the EventEmitter (module to which the pathfinder connects) is
+ * capable of accepting connections from multiple pathfinders, allowing advanced external
+ * pathfinders to be developed outside of the main cjdns project.
+ *
+ * On the point of protocol, two new headers have been defined, one is sent over the wire to other
+ * nodes and the other is merely internal protocol for communicating with the SessionManager.
+ * DataHeader is a new header, sent over the wire between any two v16+ nodes, it replaces the faux
+ * IPv6 headers which previously were sent over the wire. RouteHeader is used internally to tell
+ * SessionManager where one wants the packet to go but is never seen on the wire. The final and
+ * perhaps most significant change in this version is the loss of packet forwarding. No longer does
+ * a v16 node attempt to forward a message to another node in case that it does not know a route to
+ * the final destination instead it bufferes the packet and triggers a DHT search in the same way
+ * that Ethernet buffers a frame and triggers an ARP request. This vastly simplifies the debugging
+ * of weird routing behaviors.
+ */
+Version_COMPAT(16, ([12,13,14,15]))
+
+/**
+ * Version 17:
+ * October 9, 2015
+ *
+ * Ouvrir le parapluie
+ *
+ * When a node connects to another node, before v17, the connection password is double-hashed and
+ * sent while the password hash and a field called Derivations were hashed together (and then
+ * hashed with the shared secret from Curve25519 crypto) so that theoretically the hash of the
+ * password and a various value of Derivations could be passed to another node who could then
+ * establish a more heavily secured session. After v17 Derivations now is meaningless and the
+ * previously meaningless bit A which had been set in the CryptoHeader_Challenge is now cleared
+ * (see CryptoHeader.h)
+ *
+ * Also v17 adds a new authType, authType 2 which is for logging in with name and password.
+ * In pre-17 when a session setup packet is sent, the double-hash of the password is sent as a
+ * key so that the server can lookup the correct password to test.
+ * This means someone with the session setup packet could crack to find the actual password and
+ * then connect to the server. The change introduces a "login" in addition to the password, this
+ * instead is hashed and sent so if the attacker cracks the hash, they'll get the login and will
+ * not be able to login to the server.
+ */
+ Version_COMPAT(17, ([16]))
+
+/**
  * The current protocol version.
  */
-#define Version_CURRENT_PROTOCOL 14
-#define Version_12_COMPAT
-#define Version_13_COMPAT
-#define Version_14_COMPAT
+#define Version_CURRENT_PROTOCOL 17
+#define Version_16_COMPAT
 
-#define Version_MINIMUM_COMPATIBLE 12
-#define Version_DEFAULT_ASSUMPTION 12
+#define Version_MINIMUM_COMPATIBLE 16
+#define Version_DEFAULT_ASSUMPTION 16
 
 /**
  * Check the compatibility matrix and return whether two versions are compatible.

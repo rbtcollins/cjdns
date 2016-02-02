@@ -16,7 +16,6 @@
 #define CryptoAuth_pvt_H
 #include "crypto/CryptoAuth.h"
 #include "crypto/ReplayProtector.h"
-#include "interface/Interface.h"
 #include "benc/Object.h"
 #include "util/log/Log.h"
 #include "memory/Allocator.h"
@@ -27,13 +26,25 @@
 
 #include <stdint.h>
 
-struct CryptoAuth_Auth {
-    union CryptoHeader_Challenge challenge;
+struct CryptoAuth_User;
+struct CryptoAuth_User {
+    /** Double-hash of password for authType 1 */
+    uint8_t passwordHash[CryptoHeader_Challenge_KEYSIZE];
+
+    /** Hash of username for authType 2 */
+    uint8_t userNameHash[CryptoHeader_Challenge_KEYSIZE];
 
     uint8_t secret[32];
 
-    String* user;
-    uint8_t* restrictedToip6;
+    String* login;
+
+    uint8_t restrictedToip6[16];
+
+    struct CryptoAuth_User* next;
+
+    struct Allocator* alloc;
+
+    Identity
 };
 
 struct CryptoAuth_pvt
@@ -42,9 +53,7 @@ struct CryptoAuth_pvt
 
     uint8_t privateKey[32];
 
-    struct CryptoAuth_Auth* passwords;
-    uint32_t passwordCount;
-    uint32_t passwordCapacity;
+    struct CryptoAuth_User* users;
 
     struct Log* logger;
     struct EventBase* eventBase;
@@ -56,23 +65,11 @@ struct CryptoAuth_pvt
 };
 
 
-struct CryptoAuth_Wrapper
+struct CryptoAuth_Session_pvt
 {
-    /** The public key of the other node, all zeros is taken to mean "don't know" */
-    uint8_t herPerminentPubKey[32];
+    struct CryptoAuth_Session pub;
 
-    /**
-     * Bind this CryptoAuth session to the other node's ip6 address,
-     * any packet avertizing a key which doesn't hash to this will be dropped.
-     */
-    uint8_t herIp6[16];
-
-    /**
-     * If an object was associated with a password and the remote host authed
-     * with the password this will be the object, otherwise it will be null.
-     */
-    String* user;
-    uint8_t* restrictedToip6;
+    struct Allocator* alloc;
 
     /** The shared secret. */
     uint8_t sharedSecret[32];
@@ -83,14 +80,11 @@ struct CryptoAuth_Wrapper
 
     uint8_t ourTempPubKey[32];
 
-    /** An outgoing message which is buffered in the event that a reverse handshake is required. */
-    struct Message* bufferedMessage;
-
     /** A password to use for authing with the other party. */
     String* password;
 
-    /** Used for preventing replay attacks. */
-    struct ReplayProtector replayProtector;
+    /** The login name to auth with the other party. */
+    String* login;
 
     /** The next nonce to use. */
     uint32_t nextNonce;
@@ -99,7 +93,7 @@ struct CryptoAuth_Wrapper
     uint32_t timeOfLastPacket;
 
     /** The method to use for trying to auth with the server. */
-    uint8_t authType;
+    int authType : 8;
 
     /** True if this node began the conversation. */
     bool isInitiator : 1;
@@ -110,26 +104,17 @@ struct CryptoAuth_Wrapper
     bool established : 1;
 
     /** A pointer back to the main cryptoauth context. */
-    struct CryptoAuth_pvt* const context;
-
-    /** The internal interface which we are wrapping. */
-    struct Interface* const wrappedInterface;
-
-    /** The interface which this wrapper provides. */
-    struct Interface externalInterface;
-
-    /** A name for the wrapper which will appear in logs. */
-    char* name;
+    struct CryptoAuth_pvt* context;
 
     Identity
 };
 
 
-uint8_t CryptoAuth_receiveMessage(struct Message* received, struct Interface* interface);
+//uint8_t CryptoAuth_receiveMessage(struct Message* received, struct Iface* interface);
 
-uint8_t CryptoAuth_encryptHandshake(struct Message* message,
-                                    struct CryptoAuth_Wrapper* wrapper,
-                                    int setupMessage);
+//uint8_t CryptoAuth_encryptHandshake(struct Message* message,
+//                                    struct CryptoAuth_Wrapper* wrapper,
+//                                    int setupMessage);
 
 int CryptoAuth_decryptRndNonce(uint8_t nonce[24], struct Message* msg, uint8_t secret[32]);
 

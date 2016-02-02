@@ -25,6 +25,7 @@
 #include "dht/CJDHTConstants.h"
 #include "memory/Allocator.h"
 #include "util/AddrTools.h"
+#include "util/Hex.h"
 
 struct Context {
     struct Admin* admin;
@@ -103,7 +104,12 @@ static void pingResponse(struct RouterModule_Promise* promise,
         uint8_t fromStr[60] = "";
         Address_print(fromStr, from);
         Dict_putString(resp, String_CONST("from"), String_new(fromStr, tempAlloc), tempAlloc);
+        String* addr = Address_toString(from, tempAlloc);
+        Dict_putString(resp, String_CONST("addr"), addr, tempAlloc);
     }
+
+    Dict_putString(resp, String_CONST("deprecation"),
+        String_CONST("from,protocol,version will soon be removed"), tempAlloc);
 
     Admin_sendMessage(resp, ping->txid, ping->ctx->admin);
 }
@@ -168,15 +174,15 @@ static struct Address* getNode(String* pathStr,
             *errOut = "not_found";
             return NULL;
         } else {
-            Bits_memcpyConst(&addr, &nl->child->address, sizeof(struct Address));
+            Bits_memcpy(&addr, &nl->child->address, sizeof(struct Address));
         }
-    } else if (pathStr->len == 39 && !AddrTools_parseIp(addr.ip6.bytes, pathStr->bytes)) {
+    } else if (!AddrTools_parseIp(addr.ip6.bytes, pathStr->bytes)) {
         struct Node_Two* n = Router_lookup(ctx->router, addr.ip6.bytes);
         if (!n || Bits_memcmp(addr.ip6.bytes, n->address.ip6.bytes, 16)) {
             *errOut = "not_found";
             return NULL;
         } else {
-            Bits_memcpyConst(&addr, &n->address, sizeof(struct Address));
+            Bits_memcpy(&addr, &n->address, sizeof(struct Address));
         }
     } else {
         struct Address* a = Address_fromString(pathStr, alloc);

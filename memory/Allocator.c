@@ -16,6 +16,7 @@
 #include "memory/Allocator.h"
 #include "memory/Allocator_pvt.h"
 #include "util/Bits.h"
+#include "util/Defined.h"
 
 #include <stdio.h>
 
@@ -68,20 +69,36 @@ static void unroll(struct Allocator_pvt* context,
     }
 }
 
-void Allocator_snapshot(struct Allocator* alloc, int includeAllocations)
+static inline uint64_t bytesAllocated(struct Allocator_pvt* ctx)
+{
+    uint64_t bytes = ctx->allocatedHere;
+    for (struct Allocator_pvt* child = ctx->firstChild; child; child = child->nextSibling) {
+        bytes += bytesAllocated(child);
+    }
+    return bytes;
+}
+
+void Allocator_snapshot(struct Allocator* allocator, int includeAllocations)
 {
     // get the root allocator.
-    struct Allocator_pvt* rootAlloc = Identity_check((struct Allocator_pvt*)alloc);
-    while (rootAlloc->parent && rootAlloc->parent != rootAlloc) {
-        rootAlloc = rootAlloc->parent;
-    }
+    struct Allocator_pvt* alloc = Identity_check((struct Allocator_pvt*)allocator);
+    struct Allocator_FirstCtx* rootAlloc = Identity_check(alloc->rootAlloc);
+    alloc = Identity_check((struct Allocator_pvt*)rootAlloc);
+
     fprintf(stderr, "----- %scjdns memory snapshot -----\n", "");
 
-    unroll(rootAlloc, includeAllocations, NULL);
+    uint64_t totalAllocated = rootAlloc->maxSpace - rootAlloc->spaceAvailable;
+    uint64_t realAllocated = bytesAllocated(alloc);
 
+    unroll(alloc, includeAllocations, NULL);
+
+    if (totalAllocated != realAllocated) {
+        fprintf(stderr, "!!!!!! INTERNAL ERROR totalAllocated = [%lu] realAllocated = [%lu] !!!!!",
+                (unsigned long)totalAllocated, (unsigned long)realAllocated);
+    }
     fprintf(stderr, "totalBytes [%ld] remaining [%ld]\n",
-                    (long)rootAlloc->rootAlloc->maxSpace,
-                    (long)rootAlloc->rootAlloc->spaceAvailable);
+                    (long)rootAlloc->maxSpace,
+                    (long)rootAlloc->spaceAvailable);
 
     fprintf(stderr, "----- %scjdns memory snapshot -----\n", "end ");
 }
@@ -133,24 +150,26 @@ static inline void checkCanaries(struct Allocator_Allocation_pvt* alloc,
     #endif
 }
 
+Gcc_ALLOC_SIZE(2)
 static inline void* newAllocation(struct Allocator_pvt* context,
                                   unsigned long size,
                                   const char* fileName,
                                   int lineNum)
 {
     int64_t realSize = getRealSize(size);
-    if (context->rootAlloc->spaceAvailable <= realSize) {
+    struct Allocator_FirstCtx* rootAlloc = Identity_check(context->rootAlloc);
+    if (rootAlloc->spaceAvailable <= realSize) {
         failure(context, "Out of memory, limit exceeded", fileName, lineNum);
     }
 
-    context->rootAlloc->spaceAvailable -= realSize;
+    rootAlloc->spaceAvailable -= realSize;
     context->allocatedHere += realSize;
 
     struct Allocator_Allocation_pvt* alloc =
-        context->rootAlloc->provider(context->rootAlloc->providerContext,
-                                     NULL,
-                                     realSize,
-                                     &context->pub);
+        rootAlloc->provider(rootAlloc->providerContext,
+                            NULL,
+                            realSize,
+                            &context->pub);
     if (alloc == NULL) {
         failure(context, "Out of memory, malloc() returned NULL", fileName, lineNum);
     }
@@ -235,7 +254,7 @@ static void releaseMemory(struct Allocator_pvt* context,
         unsigned long allocatedHere = context->allocatedHere;
     #endif
 
-    context->rootAlloc->spaceAvailable += context->allocatedHere;
+    Identity_check(context->rootAlloc)->spaceAvailable += context->allocatedHere;
 
     struct Allocator_Allocation_pvt* loc = context->allocations;
     while (loc != NULL) {
@@ -286,6 +305,12 @@ static void connect(struct Allocator_pvt* parent,
     Assert_ifParanoid(child->parent == NULL);
     Assert_ifParanoid(child->lastSibling == NULL);
     Assert_ifParanoid(child->nextSibling == NULL);
+    Assert_true(parent != child);
+    if (Defined(PARANOIA)) {
+        for (struct Allocator_pvt* c = parent->firstChild; c; c = c->nextSibling) {
+            Assert_true(child != c);
+        }
+    }
     child->nextSibling = parent->firstChild;
     if (parent->firstChild) {
         parent->firstChild->lastSibling = child;
@@ -294,18 +319,147 @@ static void connect(struct Allocator_pvt* parent,
     child->parent = parent;
 }
 
-static void freeAllocator(struct Allocator_pvt* context, const char* file, int line);
-
-static void childFreed(struct Allocator_pvt* child)
+static int disconnectAllocator(struct Allocator_pvt* target, struct Allocator_List** cpp)
 {
-    struct Allocator_pvt* parent = child->parent;
-    // disconnect the child and if there are no children left then call freeAllocator()
-    // on the parent a second time. If child == parent then it's a root allocator and
-    // we do not want to double-free it.
-    disconnect(child);
-    if (parent && parent != child && !parent->firstChild && parent->pub.isFreeing) {
-        freeAllocator(parent, child->pub.fileName, child->pub.lineNum);
+    int found = 0;
+    struct Allocator_List* cp;
+    while ((cp = *cpp)) {
+        if (cp->alloc == target) {
+            *cpp = cp->next;
+            found = 1;
+            break;
+        }
+        cpp = &cp->next;
     }
+    return found;
+}
+
+static void disconnectAdopted(struct Allocator_pvt* parent, struct Allocator_pvt* child)
+{
+    Assert_true(parent->adoptions);
+    Assert_true(parent->adoptions->children);
+    Assert_true(child->adoptions);
+    Assert_true(child->adoptions->parents);
+    Assert_true(disconnectAllocator(child, &parent->adoptions->children));
+    Assert_true(disconnectAllocator(parent, &child->adoptions->parents));
+}
+
+// Shallow first search to prevent lots of flapping while we tear down the tree.
+static int pivotChildrenToAdoptedParents0(struct Allocator_pvt* context,
+                                          int depth,
+                                          int maxDepth,
+                                          const char* file,
+                                          int line)
+{
+    int out = 0;
+    if (depth == maxDepth) {
+        if (context->adoptions) {
+            // Attempt to pivot around to a parent in order to save this allocator
+            if (context->adoptions->parents) {
+                Assert_true(!context->adoptions->parents->alloc->pub.isFreeing);
+                disconnect(context);
+                connect(context->adoptions->parents->alloc, context, file, line);
+                disconnectAdopted(context->adoptions->parents->alloc, context);
+                return 0;
+            }
+            // No saving it, drop it's adoptions.
+            for (struct Allocator_List* c = context->adoptions->children; c; c = c->next) {
+                Assert_true(!c->alloc->pub.isFreeing);
+                disconnectAdopted(context, c->alloc);
+            }
+        }
+        // If (context->parent == context) it's a root allocator and disconnect does the wrong thing
+        if (depth == 0 && context->parent != context) { disconnect(context); }
+        Assert_true(!context->pub.isFreeing);
+        context->pub.isFreeing = 1;
+        out++;
+    } else {
+        struct Allocator_pvt* child = context->firstChild;
+        while (child) {
+            Assert_ifParanoid(child != context);
+            struct Allocator_pvt* nextChild = child->nextSibling;
+            out += pivotChildrenToAdoptedParents0(child, depth+1, maxDepth, file, line);
+            child = nextChild;
+        }
+    }
+    return out;
+}
+
+static int pivotChildrenToAdoptedParents(struct Allocator_pvt* context, const char* file, int line)
+{
+    for (int i = 0; i < 10000; i++) {
+        if (!pivotChildrenToAdoptedParents0(context, 0, i, file, line)) {
+            // No out on i == 0 -> the allocator pivoted to another parent, cease freeing.
+            return (i != 0);
+        }
+    }
+    Assert_failure("Didn't free all allocators in 10000 deep iterations");
+}
+
+/**
+ * Collect all of the onFree jobs from all of the child allocators (deep) and attach them all
+ * to the root of the tree which is being freed. They are not detached from their relevant
+ * allocators because those allocators will be freed soon anyway.
+ */
+static void marshalOnFreeJobs(struct Allocator_pvt* context, struct Allocator_pvt* rootToFree)
+{
+    struct Allocator_pvt* child = context->firstChild;
+    while (child) {
+        // Theoretically the order of free jobs is not promised but this prevents libuv crashing.
+        struct Allocator_OnFreeJob_pvt** jobP = &rootToFree->onFree;
+        while (*jobP != NULL) {
+            struct Allocator_OnFreeJob_pvt* job = *jobP;
+            jobP = &job->next;
+        }
+        *jobP = child->onFree;
+
+        while (*jobP != NULL) {
+            struct Allocator_OnFreeJob_pvt* job = *jobP;
+            job->alloc = rootToFree;
+            jobP = &job->next;
+        }
+
+        struct Allocator_pvt* nextChild = child->nextSibling;
+        marshalOnFreeJobs(child, rootToFree);
+        child = nextChild;
+    }
+}
+
+static void doOnFreeJobs(struct Allocator_pvt* context)
+{
+    // Do the onFree jobs.
+    struct Allocator_OnFreeJob_pvt** jobP = &context->onFree;
+    while (*jobP != NULL) {
+        struct Allocator_OnFreeJob_pvt* job = *jobP;
+        if (!job->pub.callback) {
+            // no callback, remove the job
+            Assert_true(!removeJob(job));
+            continue;
+        } else {
+            if  (job->pub.callback(&job->pub) != Allocator_ONFREE_ASYNC) {
+                Assert_true(!removeJob(job));
+                continue;
+            }
+        }
+        jobP = &job->next;
+    }
+}
+
+static void freeAllocator(struct Allocator_pvt* context)
+{
+    struct Allocator_pvt* child = context->firstChild;
+    while (child) {
+        struct Allocator_pvt* nextChild = child->nextSibling;
+        freeAllocator(child);
+        child = nextChild;
+    }
+
+    // Grab out the provider and provider context in case the root allocator is freed.
+    struct Allocator_FirstCtx* rootAlloc = Identity_check(context->rootAlloc);
+    Allocator_Provider provider = rootAlloc->provider;
+    Allocator_Provider_CONTEXT_TYPE* providerCtx = rootAlloc->providerContext;
+
+    releaseMemory(context, provider, providerCtx);
 }
 
 void Allocator_onFreeComplete(struct Allocator_OnFreeJob* onFreeJob)
@@ -319,119 +473,32 @@ void Allocator_onFreeComplete(struct Allocator_OnFreeJob* onFreeJob)
 
     if (!context->onFree) {
         // There are no more jobs, release the memory.
-        freeAllocator(context, context->pub.fileName, context->pub.lineNum);
+        freeAllocator(context);
     }
-}
-
-static void disconnectAdopted(struct Allocator_pvt* parent, struct Allocator_pvt* child)
-{
-    Assert_true(parent->adoptions);
-    Assert_true(parent->adoptions->children);
-    struct Allocator_List** cpp = &parent->adoptions->children;
-    struct Allocator_List* cp;
-    int found = 0;
-    while ((cp = *cpp)) {
-        if (cp->alloc == child) {
-            *cpp = cp->next;
-            found = 1;
-            break;
-        }
-        cpp = &cp->next;
-    }
-    Assert_true(found);
-
-    Assert_true(child->adoptions);
-    Assert_true(child->adoptions->parents);
-    cpp = &child->adoptions->parents;
-    found = 0;
-    while ((cp = *cpp)) {
-        if (cp->alloc == parent) {
-            *cpp = cp->next;
-            found = 1;
-            break;
-        }
-        cpp = &cp->next;
-    }
-    Assert_true(found);
-}
-
-/**
- * Triggered when freeAllocator() is called and the allocator nolonger
- * has any remaining links to the allocator tree.
- */
-static void freeAllocator(struct Allocator_pvt* context, const char* file, int line)
-{
-    if (context->adoptions && context->adoptions->parents) {
-        disconnect(context);
-        connect(context->adoptions->parents->alloc, context, file, line);
-        disconnectAdopted(context->adoptions->parents->alloc, context);
-        return;
-    }
-
-    // When the last child calls us back via childFreed() we will be called the last time and
-    // if this is not set, the child will be disconnected from us and we will be left.
-    context->pub.isFreeing = 1;
-
-    // from now on, fileName/line will point to the place of freeing.
-    // this allows childFreed() to tell the truth when calling us back.
-    context->pub.fileName = file;
-    context->pub.lineNum = line;
-
-    // Disconnect adopted children.
-    struct Allocator_List* childL = context->adoptions ? context->adoptions->children : NULL;
-    while (childL) {
-        disconnectAdopted(context, childL->alloc);
-        childL = childL->next;
-    }
-
-    // Do the onFree jobs.
-    struct Allocator_OnFreeJob_pvt** jobP = &context->onFree;
-    while (*jobP != NULL) {
-        struct Allocator_OnFreeJob_pvt* job = *jobP;
-        if (!job->pub.callback) {
-            // no callback, remove the job
-            Assert_true(!removeJob(job));
-            continue;
-        } else if (!job->done) {
-            if  (job->pub.callback(&job->pub) != Allocator_ONFREE_ASYNC) {
-                Assert_true(!removeJob(job));
-                continue;
-            }
-            // asynchronously completing, don't bother it again.
-            job->done = 1;
-        }
-        jobP = &job->next;
-    }
-
-    if (context->onFree) {
-        // onFreeComplete() will call us back.
-        return;
-    }
-
-    // Free children
-    struct Allocator_pvt* child = context->firstChild;
-    if (child) {
-        while (child) {
-            struct Allocator_pvt* nextChild = child->nextSibling;
-            freeAllocator(child, file, line);
-            child = nextChild;
-        }
-        // childFreed() will call us back.
-        return;
-    }
-
-    // Grab out the provider and provider context in case the root allocator is freed.
-    Allocator_Provider provider = context->rootAlloc->provider;
-    Allocator_Provider_CONTEXT_TYPE* providerCtx = context->rootAlloc->providerContext;
-
-    childFreed(context);
-    releaseMemory(context, provider, providerCtx);
 }
 
 void Allocator__free(struct Allocator* alloc, const char* file, int line)
 {
     struct Allocator_pvt* context = Identity_check((struct Allocator_pvt*) alloc);
-    freeAllocator(context, file, line);
+
+    // It's really difficult to know that you didn't get called back inside of a freeing of a
+    // parent of a parent allocator which causes your allocator to be in isFreeing state so
+    // lets be forgiving here.
+    if (context->pub.isFreeing) { return; }
+
+    if (context->rootAlloc == (struct Allocator_FirstCtx*)context) {
+        struct Allocator_FirstCtx* rootAlloc = Identity_check((struct Allocator_FirstCtx*)context);
+        if (bytesAllocated(context) + rootAlloc->spaceAvailable != (uint64_t)rootAlloc->maxSpace) {
+            failure(context, "unaccounted for memory", file, line);
+        }
+    }
+
+    if (!pivotChildrenToAdoptedParents(context, file, line)) { return; }
+    marshalOnFreeJobs(context, context);
+    doOnFreeJobs(context);
+    if (!context->onFree) {
+        freeAllocator(context);
+    }
 }
 
 void* Allocator__malloc(struct Allocator* allocator,
@@ -554,7 +621,7 @@ struct Allocator* Allocator__child(struct Allocator* allocator, const char* file
 
     struct Allocator_pvt* child =
         newAllocation(&stackChild, sizeof(struct Allocator_pvt), file, line);
-    Bits_memcpyConst(child, &stackChild, sizeof(struct Allocator_pvt));
+    Bits_memcpy(child, &stackChild, sizeof(struct Allocator_pvt));
 
     // Link the child into the parent's allocator list
     connect(parent, child, file, line);
@@ -601,6 +668,32 @@ static int isAncestorOf(struct Allocator_pvt* maybeParent,
     return 0;
 }
 
+void Allocator__disown(struct Allocator* parentAlloc,
+                       struct Allocator* allocToDisown,
+                       const char* fileName,
+                       int lineNum)
+{
+    struct Allocator_pvt* parent = Identity_check((struct Allocator_pvt*) parentAlloc);
+    struct Allocator_pvt* child = Identity_check((struct Allocator_pvt*) allocToDisown);
+
+    if (parent->pub.isFreeing || child->pub.isFreeing) { return; }
+
+    if (child->parent == parent) {
+        // The child's natural parent has been freed and it has pivoted to the adopted parent
+        // Do a normal Allocator_free() and it will either pivot once again to another adopter
+        // or it will drop from the tree and free.
+        Allocator__free(&child->pub, fileName, lineNum);
+        return;
+    }
+
+    if (isAncestorOf(child, parent)) {
+        // Rare but possible way that the child would never have been adopted.
+        return;
+    }
+
+    disconnectAdopted(parent, child);
+}
+
 void Allocator__adopt(struct Allocator* adoptedParent,
                       struct Allocator* childToAdopt,
                       const char* file,
@@ -608,6 +701,9 @@ void Allocator__adopt(struct Allocator* adoptedParent,
 {
     struct Allocator_pvt* parent = Identity_check((struct Allocator_pvt*) adoptedParent);
     struct Allocator_pvt* child = Identity_check((struct Allocator_pvt*) childToAdopt);
+
+    if (parent->pub.isFreeing) { return; }
+    Assert_true(!child->pub.isFreeing);
 
     if (isAncestorOf(child, parent)) {
         // The child is a parent of the parent, this means an adoption would be meaningless
@@ -625,7 +721,7 @@ void Allocator__adopt(struct Allocator* adoptedParent,
     }
 
     struct Allocator_List* pl =
-        Allocator__calloc(adoptedParent, sizeof(struct Allocator_List), 1, file, line);
+        Allocator__calloc(childToAdopt, sizeof(struct Allocator_List), 1, file, line);
     pl->alloc = child;
     pl->next = parent->adoptions->children;
     parent->adoptions->children = pl;
@@ -698,6 +794,7 @@ struct Allocator* Allocator_new(unsigned long sizeLimit,
     };
     stackContext.maxSpace = stackContext.spaceAvailable;
     stackContext.context.rootAlloc = &stackContext;
+    Identity_set(&stackContext);
     Identity_set(&stackContext.context);
 
     struct Allocator_FirstCtx* firstContext =
@@ -711,17 +808,7 @@ struct Allocator* Allocator_new(unsigned long sizeLimit,
     context->rootAlloc = firstContext;
     context->parent = context;
 
-    Identity_set(context);
     return &context->pub;
-}
-
-static inline uint64_t bytesAllocated(struct Allocator_pvt* ctx)
-{
-    uint64_t bytes = ctx->allocatedHere;
-    for (struct Allocator_pvt* child = ctx->firstChild; child; child = child->nextSibling) {
-        bytes += bytesAllocated(child);
-    }
-    return bytes;
 }
 
 unsigned long Allocator_bytesAllocated(struct Allocator* allocator)

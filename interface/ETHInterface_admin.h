@@ -17,14 +17,14 @@
 
 #include "admin/Admin.h"
 #include "memory/Allocator.h"
-#include "interface/InterfaceController.h"
+#include "net/InterfaceController.h"
 #include "util/log/Log.h"
 #include "util/events/EventBase.h"
 #include "util/Linker.h"
-Linker_require("interface/ETHInterface_admin.c")
+Linker_require("interface/ETHInterface_admin.c");
 
 void ETHInterface_admin_register(struct EventBase* base,
-                                 struct Allocator* allocator,
+                                 struct Allocator* alloc,
                                  struct Log* logger,
                                  struct Admin* admin,
                                  struct InterfaceController* ic);

@@ -15,49 +15,31 @@
 #ifndef IpTunnel_H
 #define IpTunnel_H
 
-#include "admin/angel/Hermes.h"
 #include "crypto/random/Random.h"
-#include "interface/Interface.h"
 #include "memory/Allocator.h"
+#include "interface/Iface.h"
 #include "util/log/Log.h"
 #include "util/events/EventBase.h"
 #include "util/platform/Sockaddr.h"
+#include "wire/RouteHeader.h"
 #include "util/Linker.h"
-Linker_require("tunnel/IpTunnel.c")
-
-#include <stdint.h>
-
-/** This header shall be on all messages sent in and out of the nodeInterface. */
-struct IpTunnel_PacketInfoHeader
-{
-    /**
-     * When the IpTunnel sends a message out the nodeInterface, this is the Ip6 of the node
-     * which the message should be sent to. When the IpTunnel receives a message from the
-     * nodeInterface this is the address of the node from which it came.
-     */
-    uint8_t nodeIp6Addr[16];
-
-    /** The full 32 byte key which corrisponds to the above Ip6 address. */
-    uint8_t nodeKey[32];
-};
-#define IpTunnel_PacketInfoHeader_SIZE 48
-Assert_compileTime(sizeof(struct IpTunnel_PacketInfoHeader) == IpTunnel_PacketInfoHeader_SIZE);
+Linker_require("tunnel/IpTunnel.c");
 
 struct IpTunnel_Connection
 {
-    /** The header which is used for this connection. */
-    struct IpTunnel_PacketInfoHeader header;
+    /** The header for routing to this node. */
+    struct RouteHeader routeHeader;
 
     /** The IPv6 address used for this connection or all zeros if none was assigned. */
     uint8_t connectionIp6[16];
 
-    /** The IPv6 netmask/prefix length, in bits. Defaults to 0 if none was assigned. */
-    uint8_t connectionIp6Prefix;
-
     /** The IPv4 address used for this connection or all zeros if none was assigned. */
     uint8_t connectionIp4[4];
 
-    /** The IPv4 netmask/prefix length, in bits. Defaults to 0 if none was assigned. */
+    /** The IPv6 netmask/prefix length, in bits. Defaults to 128 if none was assigned. */
+    uint8_t connectionIp6Prefix;
+
+    /** The IPv4 netmask/prefix length, in bits. Defaults to 32 if none was assigned. */
     uint8_t connectionIp4Prefix;
 
     /** non-zero if the connection was made using IpTunnel_connectTo(). */
@@ -70,13 +52,13 @@ struct IpTunnel_Connection
 struct IpTunnel
 {
     /** The interface used to send and receive messages to the TUN device. */
-    struct Interface tunInterface;
+    struct Iface tunInterface;
 
     /**
      * The interface used to send and receive messages to other nodes.
-     * All messages sent on this interface shall be preceeded with the IpTunnel_PacketInfoHeader.
+     * All messages sent on this interface shall be preceeded with the RouterHeader and DataHeader.
      */
-    struct Interface nodeInterface;
+    struct Iface nodeInterface;
 
     /**
      * The list of registered connections, do not modify manually.
@@ -95,13 +77,11 @@ struct IpTunnel
  * @param eventBase the event base.
  * @param alloc an allocator.
  * @param rand a random generator.
- * @param hermes the Hermes admin connector.
  */
 struct IpTunnel* IpTunnel_new(struct Log* logger,
                               struct EventBase* eventBase,
                               struct Allocator* alloc,
-                              struct Random* rand,
-                              struct Hermes* hermes);
+                              struct Random* rand);
 
 /**
  * Allow another node to tunnel IPv4 and/or ICANN IPv6 through this node.

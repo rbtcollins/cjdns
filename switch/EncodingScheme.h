@@ -19,7 +19,7 @@
 #include "benc/List.h"
 #include "memory/Allocator.h"
 #include "util/Linker.h"
-Linker_require("switch/EncodingScheme.c")
+Linker_require("switch/EncodingScheme.c");
 
 #include <stdint.h>
 
@@ -103,5 +103,10 @@ List* EncodingScheme_asList(struct EncodingScheme* list, struct Allocator* alloc
  * Return true if the route is to the switch's router interface.
  */
 int EncodingScheme_isSelfRoute(struct EncodingScheme* scheme, uint64_t routeLabel);
+
+/**
+ * @return non-zero if the route label is one hop.
+ */
+int EncodingScheme_isOneHop(struct EncodingScheme* scheme, uint64_t routeLabel);
 
 #endif

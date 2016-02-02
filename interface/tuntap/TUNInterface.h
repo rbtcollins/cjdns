@@ -19,9 +19,8 @@
 #include "util/log/Log.h"
 #include "exception/Except.h"
 #include "memory/Allocator.h"
-#include "interface/Interface.h"
 #include "util/Linker.h"
-Linker_require("interface/tuntap/TUNInterface_" + builder.config.systemName + ".c")
+Linker_require("interface/tuntap/TUNInterface_" + builder.config.systemName + ".c");
 
 /**
  * This is the maximum size that will be accepted as an interface name.
@@ -47,7 +46,7 @@ Linker_require("interface/tuntap/TUNInterface_" + builder.config.systemName + ".
  * @param allocator a means of getting memory.
  * @return a Interface.
  */
-struct Interface* TUNInterface_new(const char* interfaceName,
+struct Iface* TUNInterface_new(const char* interfaceName,
                                    char assignedInterfaceName[TUNInterface_IFNAMSIZ],
                                    int isTapMode,
                                    struct EventBase* base,

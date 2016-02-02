@@ -15,6 +15,7 @@
 #include "benc/String.h"
 #include "crypto/random/Random.h"
 #include "switch/EncodingScheme.h"
+#include "switch/NumberCompress.h"
 #include "memory/Allocator.h"
 #include "memory/MallocAllocator.h"
 #include "util/Bits.h"
@@ -71,7 +72,7 @@ static struct EncodingScheme* randomScheme(struct Random* rand, struct Allocator
             if (((out->forms[j].prefix ^ out->forms[i].prefix) & ((1<<minPfx)-1)) == 0) {
                 // collision, destroy both entries and try again.
                 if (j != i-1) {
-                    Bits_memcpyConst(&out->forms[j],
+                    Bits_memcpy(&out->forms[j],
                                      &out->forms[i-1],
                                      sizeof(struct EncodingScheme_Form));
                 }
@@ -167,8 +168,8 @@ static int convertLabel(struct EncodingScheme_Form* iform,
     } s;
     s.scheme.count = 2;
     s.scheme.forms = s.forms;
-    Bits_memcpyConst(&s.forms[0], iform, sizeof(struct EncodingScheme_Form));
-    Bits_memcpyConst(&s.forms[1], oform, sizeof(struct EncodingScheme_Form));
+    Bits_memcpy(&s.forms[0], iform, sizeof(struct EncodingScheme_Form));
+    Bits_memcpy(&s.forms[1], oform, sizeof(struct EncodingScheme_Form));
 
     int iformNum = 0;
     int oformNum = 1;
@@ -268,12 +269,37 @@ static void convertLabelRand(struct Random* rand, struct EncodingScheme* scheme)
     }
 }
 
+static void isOneHopScheme(struct Allocator* allocator)
+{
+    struct Allocator* alloc = Allocator_child(allocator);
+    struct EncodingScheme* s4x8 = NumberCompress_v4x8_defineScheme(alloc);
+    Assert_true(!EncodingScheme_isOneHop(s4x8, 1));
+    Assert_true(EncodingScheme_isOneHop(s4x8, 0x21));
+    Assert_true(EncodingScheme_isOneHop(s4x8, 0x23));
+    Assert_true(!EncodingScheme_isOneHop(s4x8, 0x12));
+    Assert_true(EncodingScheme_isOneHop(s4x8, 0x220));
+    Assert_true(EncodingScheme_isOneHop(s4x8, 0x210));
+    Assert_true(!EncodingScheme_isOneHop(s4x8, 0x110));
+
+    struct EncodingScheme* s3x5x8 = NumberCompress_v3x5x8_defineScheme(alloc);
+    Assert_true(!EncodingScheme_isOneHop(s3x5x8, 1));
+    Assert_true(EncodingScheme_isOneHop(s3x5x8, 0x13));
+    Assert_true(EncodingScheme_isOneHop(s3x5x8, 0x15));
+    Assert_true(EncodingScheme_isOneHop(s3x5x8, 0x96));
+    Assert_true(EncodingScheme_isOneHop(s3x5x8, 0x400));
+    Assert_true(!EncodingScheme_isOneHop(s3x5x8, 0x115));
+    Assert_true(!EncodingScheme_isOneHop(s3x5x8, 0x166));
+    Assert_true(!EncodingScheme_isOneHop(s3x5x8, 0x1400));
+    Allocator_free(alloc);
+}
+
 int main()
 {
     struct Allocator* alloc = MallocAllocator_new(20000000);
     struct Random* rand = Random_new(alloc, NULL, NULL);
 
     encoding(alloc);
+    isOneHopScheme(alloc);
 
     for (int i = 0; i < 1000; i++) {
         randomTest(alloc, rand);
@@ -296,5 +322,16 @@ int main()
         convertLabelRand(rand, scheme);
         Allocator_free(tempAlloc);
     }
+
+    struct Allocator* tempAlloc = Allocator_child(alloc);
+    struct EncodingScheme* scheme = NumberCompress_v3x5x8_defineScheme(alloc);
+    for (int i = 0; i < NumberCompress_v3x5x8_INTERFACES; i++) {
+        int bits = NumberCompress_bitsUsedForNumber(i);
+        uint64_t expected = NumberCompress_getCompressed(i, bits);
+        Assert_true(expected == EncodingScheme_convertLabel(scheme, expected,
+                    EncodingScheme_convertLabel_convertTo_CANNONICAL));
+    }
+    Allocator_free(tempAlloc);
+
     return 0;
 }

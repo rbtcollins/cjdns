@@ -19,7 +19,7 @@
 #include "memory/Allocator.h"
 #include "dht/dhtcore/Node.h"
 #include "util/Linker.h"
-Linker_require("dht/dhtcore/Router.c")
+Linker_require("dht/dhtcore/Router.c");
 
 /**
  * This is a facad around the other internals of dht/dhtcore.
@@ -39,11 +39,9 @@ void Router_sendGetPeers(struct Router* r,
 
 struct Node_Two* Router_lookup(struct Router* r, uint8_t targetAddr[16]);
 
-void Router_brokenLink(struct Router* r, uint64_t path, uint64_t labelAtErrorHop);
+//void Router_brokenLink(struct Router* r, uint64_t path, uint64_t labelAtErrorHop);
 
-void Router_searchForNode(struct Router* r, uint8_t ip6[16], struct Allocator* alloc);
-
-void Router_disconnectedPeer(struct Router* r, uint64_t path);
+//void Router_disconnectedPeer(struct Router* r, uint64_t path);
 
 struct Node_Link* Router_linkForPath(struct Router* r, uint64_t path);
 

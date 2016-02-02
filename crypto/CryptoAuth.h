@@ -17,13 +17,14 @@
 
 #include "benc/Object.h"
 #include "crypto/random/Random.h"
-#include "interface/Interface.h"
+#include "crypto/ReplayProtector.h"
 #include "memory/Allocator.h"
 #include "util/Endian.h"
 #include "util/log/Log.h"
 #include "util/events/EventBase.h"
+#include "wire/Message.h"
 #include "util/Linker.h"
-Linker_require("crypto/CryptoAuth.c")
+Linker_require("crypto/CryptoAuth.c");
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -41,8 +42,20 @@ struct CryptoAuth
     uint32_t resetAfterInactivitySeconds;
 };
 
-/** The internal interface wrapper struct. */
-struct CryptoAuth_Wrapper;
+struct CryptoAuth_Session
+{
+    uint8_t herPublicKey[32];
+
+    String* displayName;
+
+    struct ReplayProtector replayProtector;
+
+    /**
+     * Bind this CryptoAuth session to the other node's ip6 address,
+     * any packet avertizing a key which doesn't hash to this will be dropped.
+     */
+    uint8_t herIp6[16];
+};
 
 /**
  * Associate a password:authtype pair with a user object.
@@ -60,25 +73,18 @@ struct CryptoAuth_Wrapper;
  *             to the given IPv6 address.
  * @param context The CryptoAuth context.
  * @return 0 if all goes well,
- *         CryptoAuth_addUser_INVALID_AUTHTYPE if the authentication method is not supported,
- *         CryptoAuth_addUser_OUT_OF_SPACE if there is not enough space to store the entry,
  *         CryptoAuth_addUser_DUPLICATE if the same *password* already exists.
- *         CryptoAuth_addUser_INVALID_IP if the ipv6 is not valid.
  */
-#define CryptoAuth_addUser_INVALID_AUTHTYPE  -1
-#define CryptoAuth_addUser_OUT_OF_SPACE      -2
 #define CryptoAuth_addUser_DUPLICATE         -3
-#define CryptoAuth_addUser_INVALID_IP        -4
-int32_t CryptoAuth_addUser_ipv6(String* password,
-                           uint8_t authType,
-                           String* user,
-                           String* ipv6,
-                           struct CryptoAuth* context);
+int CryptoAuth_addUser_ipv6(String* password,
+                            String* login,
+                            uint8_t ipv6[16],
+                            struct CryptoAuth* ca);
 
-int32_t CryptoAuth_addUser(String* password,
-                           uint8_t authType,
-                           String* user,
-                           struct CryptoAuth* context);
+static inline int CryptoAuth_addUser(String* password, String* login, struct CryptoAuth* ca)
+{
+    return CryptoAuth_addUser_ipv6(password, login, NULL, ca);
+}
 
 /**
  * Remove all users registered with this CryptoAuth.
@@ -97,17 +103,6 @@ int CryptoAuth_removeUsers(struct CryptoAuth* context, String* user);
  * @returns List* containing the user String's
  */
 List* CryptoAuth_getUsers(struct CryptoAuth* context, struct Allocator* alloc);
-
-/**
- * Get the user object associated with the authenticated session or NULL if there is none.
- * Please make sure to only call this on interfaces which were actually returned by
- * CryptoAuth_wrapInterface() as strange and interesting bugs will result otherwise.
- *
- * @param interface an interface as returned by CryptoAuth_wrapInterface().
- * @return the user object added by calling CryptoAuth_addUser() or NULL if this session is not
- *         authenticated.
- */
-String* CryptoAuth_getUser(struct Interface* iface);
 
 /**
  * Create a new crypto authenticator.
@@ -129,28 +124,28 @@ struct CryptoAuth* CryptoAuth_new(struct Allocator* allocator,
 /**
  * Wrap an interface with crypto authentication.
  *
- * NOTE: Sending empty packets during the handshake is not allowed!
- *       Empty packets are used for signaling during the handshake so they can
- *       only be used while the session is in state ESTABLISHED.
- *
  * NOTE2: Every received packet is prefixed by the 4 byte *nonce* for that packet
  *        in host endian order.
  *
  * @param toWarp the interface to wrap
  * @param herPublicKey the public key of the other party or NULL if unknown.
- * @param herIp6 the ipv6 address of the other party
  * @param requireAuth if the remote end of this interface begins the connection, require
  *                    them to present valid authentication credentials to connect.
  *                    If this end begins the connection, this parameter has no effect.
  * @param name a name for this CA which will appear in logs.
  * @param context the CryptoAuth context.
  */
-struct Interface* CryptoAuth_wrapInterface(struct Interface* toWrap,
-                                           const uint8_t herPublicKey[32],
-                                           const uint8_t herIp6[16],
-                                           const bool requireAuth,
-                                           char* name,
-                                           struct CryptoAuth* ca);
+struct CryptoAuth_Session* CryptoAuth_newSession(struct CryptoAuth* ca,
+                                                 struct Allocator* alloc,
+                                                 const uint8_t herPublicKey[32],
+                                                 const bool requireAuth,
+                                                 char* name);
+
+/** @return 0 on success, -1 otherwise. */
+int CryptoAuth_encrypt(struct CryptoAuth_Session* session, struct Message* msg);
+
+/** @return 0 on success, -1 otherwise. */
+int CryptoAuth_decrypt(struct CryptoAuth_Session* session, struct Message* msg);
 
 /**
  * Choose the authentication credentials to use.
@@ -159,20 +154,20 @@ struct Interface* CryptoAuth_wrapInterface(struct Interface* toWrap,
  *
  * @param password the password to use for authenticating, this must match the password given to
  *                 CryptoAuth_addUser() at the other end of the connection.
- * @param authType this must match CryptoAuth_addUser() at the other end of the connection.
+ * @param login the username to use for logging in with the other node.
+ *              if null then the authtype will be type 1 (password only).
  * @param wrappedInterface this MUST be the output from CryptoAuth_wrapInterface().
  */
 void CryptoAuth_setAuth(const String* password,
-                        const uint8_t authType,
-                        struct Interface* wrappedInterface);
-
-/** @return a pointer to the other party's public key. */
-uint8_t* CryptoAuth_getHerPublicKey(struct Interface* iface);
+                        const String* login,
+                        struct CryptoAuth_Session* caSession);
 
 /** Reset the session's state to CryptoAuth_NEW, a new connection will be negotiated. */
-void CryptoAuth_reset(struct Interface* iface);
+//void CryptoAuth_reset(struct CryptoAuth_Session* session);
 
-void CryptoAuth_resetIfTimeout(struct Interface* iface);
+void CryptoAuth_resetIfTimeout(struct CryptoAuth_Session* session);
+
+void CryptoAuth_reset(struct CryptoAuth_Session* caSession);
 
 /** New CryptoAuth session, has not sent or received anything. */
 #define CryptoAuth_NEW         0
@@ -213,22 +208,6 @@ static inline char* CryptoAuth_stateString(int state)
  *                CryptoAuth_HANDSHAKE2 or
  *                CryptoAuth_ESTABLISHED
  */
-int CryptoAuth_getState(struct Interface* iface);
-
-/**
- * Get the interface on the other side of this CryptoAuth session.
- *
- * Given a wrapped interface, get the wrapping interface.
- * given a wrapping interface, get the one which is wrapped.
- *
- * @param iface the wrapped or wrapper iface.
- * @return the opposite.
- */
-struct Interface* CryptoAuth_getConnectedInterface(struct Interface* iface);
-
-/**
- * Get the structure which is used to protect against packet replay attacks.
- */
-struct ReplayProtector* CryptoAuth_getReplayProtector(struct Interface* iface);
+int CryptoAuth_getState(struct CryptoAuth_Session* session);
 
 #endif

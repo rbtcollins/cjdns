@@ -23,10 +23,13 @@
 #include "switch/EncodingScheme.h"
 #include "util/Linker.h"
 #include "util/events/EventBase.h"
-Linker_require("dht/dhtcore/NodeStore.c")
+Linker_require("dht/dhtcore/NodeStore.c");
 
 #include <stdint.h>
 #include <stdbool.h>
+
+
+typedef void (* NodeStore_OnBestPathChange)(void* userData, struct Node_Two* node);
 
 struct NodeStore
 {
@@ -34,6 +37,7 @@ struct NodeStore
 
     struct Node_Two* selfNode;
 
+    int pinnedNodes;
     int peerCount;
     int linkedNodes;
 
@@ -42,10 +46,13 @@ struct NodeStore
 
     int linkCount;
     int linkCapacity;
+
+    NodeStore_OnBestPathChange onBestPathChange;
+    void* onBestPathChangeCtx;
 };
 
 #define NodeStore_DEFAULT_NODE_CAPACITY 128
-#define NodeStore_DEFAULT_LINK_CAPACITY 2048
+#define NodeStore_DEFAULT_LINK_CAPACITY 4096
 
 /**
  * Create a new NodeStore.
@@ -65,11 +72,10 @@ struct NodeStore* NodeStore_new(struct Address* myAddress,
  *
  * @param nodeStore the store
  * @param addr the address of the new node
- * @param reachDiff the amount to credit this node
  * @param scheme the encoding scheme used by this node.
  * @param encodingFormNumber the number of the smallest possible encoding form for to encoding
  *                           the interface number through which this message came.
- * @param reach the quality of the path to the new node
+ * @param milliseconds round-trip-time of the ping/getPeers/search that discovered this node.
  */
 struct Node_Link* NodeStore_discoverNode(struct NodeStore* nodeStore,
                                          struct Address* addr,
@@ -130,6 +136,11 @@ uint64_t NodeStore_optimizePath(struct NodeStore* nodeStore, uint64_t path);
  */
 #define NodeStore_getRouteLabel_PARENT_NOT_FOUND           ((~((uint64_t)0))-1)
 #define NodeStore_getRouteLabel_CHILD_NOT_FOUND            ((~((uint64_t)0))-2)
+#define NodeStore_getRouteLabel__ERR_MIN                   ((~((uint64_t)0))-3)
+static inline bool NodeStore_getRouteLabel_ERR(uint64_t x)
+{
+    return NodeStore_getRouteLabel__ERR_MIN <= x;
+}
 uint64_t NodeStore_getRouteLabel(struct NodeStore* nodeStore,
                                  uint64_t pathToParent,
                                  uint64_t pathParentToChild);
@@ -142,6 +153,7 @@ char* NodeStore_getRouteLabel_strerror(uint64_t returnVal);
 
 
 /**
+ * FIXME(arceliar): Documentation is out of date
  * Find the one best node using LinkStateNodeCollector. LinkStateNodeCollector prefers a
  * keyspace match (same address). It breaks ties by choosing the highest version node
  * (versions above it's own are considered the same as it's version). It breaks ties of the
@@ -184,7 +196,7 @@ struct NodeList* NodeStore_getClosestNodes(struct NodeStore* store,
                                            uint32_t versionOfRequestingNode,
                                            struct Allocator* allocator);
 
-// Used to update reach when a ping/search response comes in
+// Used to update cost when a ping/search response comes in
 void NodeStore_pathResponse(struct NodeStore* nodeStore, uint64_t path, uint64_t milliseconds);
 void NodeStore_pathTimeout(struct NodeStore* nodeStore, uint64_t path);
 
@@ -201,12 +213,13 @@ void NodeStore_brokenLink(struct NodeStore* nodeStore, uint64_t path, uint64_t p
 void NodeStore_disconnectedPeer(struct NodeStore* nodeStore, uint64_t path);
 
 struct Node_Two* NodeStore_getNextNode(struct NodeStore* nodeStore, struct Node_Two* lastNode);
+struct Node_Link* NodeStore_getNextLink(struct NodeStore* nodeStore, struct Node_Link* last);
 
 uint64_t NodeStore_timeSinceLastPing(struct NodeStore* nodeStore, struct Node_Two* node);
 
 // Used for DHT maintenance.
 #define NodeStore_bucketSize 4
-#define NodeStore_bucketNumber 512
+#define NodeStore_bucketNumber 128
 struct Address NodeStore_addrForBucket(struct Address* source, uint16_t bucket);
 uint16_t NodeStore_bucketForAddr(struct Address* source, struct Address* dest);
 struct NodeList* NodeStore_getNodesForBucket(struct NodeStore* nodeStore,

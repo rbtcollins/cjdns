@@ -28,11 +28,6 @@
 #include "util/events/Timeout.h"
 #include "util/version/Version.h"
 
-
-/** The maximum number of requests to make before calling a search failed. */
-#define MAX_REQUESTS_PER_SEARCH 8
-
-
 struct SearchRunner_pvt
 {
     struct SearchRunner pub;
@@ -70,6 +65,13 @@ struct SearchRunner_Search
 
     /** The number of requests which have been sent out so far for this search. */
     uint32_t totalRequests;
+
+    /** Maximum number of requests to make before terminating the search. */
+    uint32_t maxRequests;
+
+    uint32_t maxRequestsIfFound;
+
+    uint32_t numFinds;
 
     /** The address which we are searching for. */
     struct Address target;
@@ -130,8 +132,19 @@ static void searchReplyCallback(struct RouterModule_Promise* promise,
     struct SearchRunner_Search* search =
         Identity_check((struct SearchRunner_Search*)promise->userData);
 
+    if (!Bits_memcmp(from->ip6.bytes, search->lastNodeAsked.ip6.bytes, 16)) {
+        Timeout_resetTimeout(search->continueSearchTimeout,
+                RouterModule_searchTimeoutMilliseconds(search->runner->router));
+    }
+
+    if (!Bits_memcmp(from->ip6.bytes, search->target.ip6.bytes, 16)) {
+        search->numFinds++;
+    }
+
     struct Address_List* nodeList =
         ReplySerializer_parse(from, result, search->runner->logger, true, promise->alloc);
+
+    struct Address* best = NULL;
 
     for (int i = 0; nodeList && i < nodeList->length; i++) {
         if (isDuplicateEntry(nodeList, i)) {
@@ -156,9 +169,24 @@ static void searchReplyCallback(struct RouterModule_Promise* promise,
             RumorMill_addNode(search->runner->rumorMill, &nodeList->elems[i]);
         }
 
-        nodeList->elems[i].path =
-            NodeStore_optimizePath(search->runner->nodeStore, nodeList->elems[i].path);
+        //nodeList->elems[i].path =
+        //    NodeStore_optimizePath(search->runner->nodeStore, nodeList->elems[i].path);
+
+        if (!Bits_memcmp(nodeList->elems[i].ip6.bytes, search->target.ip6.bytes, 16)) {
+            if (!best) {
+                best = &nodeList->elems[i];
+                continue;
+            } else if (nodeList->elems[i].path < best->path) {
+                SearchStore_addNodeToSearch(best, search->search);
+                best = &nodeList->elems[i];
+                continue;
+            }
+        }
+
         SearchStore_addNodeToSearch(&nodeList->elems[i], search->search);
+    }
+    if (best) {
+        SearchStore_addNodeToSearch(best, search->search);
     }
 }
 
@@ -188,40 +216,39 @@ static void searchStep(struct SearchRunner_Search* search)
 {
     struct SearchRunner_pvt* ctx = Identity_check((struct SearchRunner_pvt*)search->runner);
 
-    struct Node_Two* node;
     struct SearchStore_Node* nextSearchNode;
     for (;;) {
         nextSearchNode = SearchStore_getNextNode(search->search);
 
         // If the number of requests sent has exceeded the max search requests, let's stop there.
-        if (search->totalRequests >= MAX_REQUESTS_PER_SEARCH || nextSearchNode == NULL) {
-            if (search->pub.callback) {
-                search->pub.callback(&search->pub, 0, NULL, NULL);
-            }
-            Allocator_free(search->pub.alloc);
-            return;
+        if (search->totalRequests >= search->maxRequests) {
+            // fallthrough
+        } else if (search->numFinds > 0 && search->totalRequests >= search->maxRequestsIfFound) {
+            // fallthrough
+        } else if (nextSearchNode == NULL) {
+            // fallthrough
+        } else {
+            break;
         }
-
-        node = NodeStore_getBest(ctx->nodeStore, nextSearchNode->address.ip6.bytes);
-
-        if (!node) { continue; }
-        if (node == ctx->nodeStore->selfNode) { continue; }
-        if (Bits_memcmp(node->address.ip6.bytes, nextSearchNode->address.ip6.bytes, 16)) {
-            continue;
+        if (search->pub.callback) {
+            search->pub.callback(&search->pub, 0, NULL, NULL);
         }
-
-        break;
+        Allocator_free(search->pub.alloc);
+        return;
     }
 
-    Assert_true(node != ctx->nodeStore->selfNode);
-
-    Bits_memcpyConst(&search->lastNodeAsked, &node->address, sizeof(struct Address));
+    Bits_memcpy(&search->lastNodeAsked, &nextSearchNode->address, sizeof(struct Address));
 
     struct RouterModule_Promise* rp =
-        RouterModule_newMessage(&node->address, 0, ctx->router, search->pub.alloc);
+        RouterModule_newMessage(&nextSearchNode->address, 0, ctx->router, search->pub.alloc);
 
     Dict* message = Dict_new(rp->alloc);
-    Dict_putString(message, CJDHTConstants_QUERY, CJDHTConstants_QUERY_FN, rp->alloc);
+
+    if (!Bits_memcmp(nextSearchNode->address.ip6.bytes, search->target.ip6.bytes, 16)) {
+        Dict_putString(message, CJDHTConstants_QUERY, CJDHTConstants_QUERY_GP, rp->alloc);
+    } else {
+        Dict_putString(message, CJDHTConstants_QUERY, CJDHTConstants_QUERY_FN, rp->alloc);
+    }
     Dict_putString(message, CJDHTConstants_TARGET, search->targetStr, rp->alloc);
 
     rp->userData = search;
@@ -273,8 +300,8 @@ struct SearchRunner_SearchData* SearchRunner_showActiveSearch(struct SearchRunne
         Allocator_calloc(alloc, sizeof(struct SearchRunner_SearchData), 1);
 
     if (search) {
-        Bits_memcpyConst(out->target, &search->target.ip6.bytes, 16);
-        Bits_memcpyConst(&out->lastNodeAsked, &search->lastNodeAsked, sizeof(struct Address));
+        Bits_memcpy(out->target, &search->target.ip6.bytes, 16);
+        Bits_memcpy(&out->lastNodeAsked, &search->lastNodeAsked, sizeof(struct Address));
         out->totalRequests = search->totalRequests;
     }
     out->activeSearches = runner->searches;
@@ -283,6 +310,8 @@ struct SearchRunner_SearchData* SearchRunner_showActiveSearch(struct SearchRunne
 }
 
 struct RouterModule_Promise* SearchRunner_search(uint8_t target[16],
+                                                 int maxRequests,
+                                                 int maxRequestsIfFound,
                                                  struct SearchRunner* searchRunner,
                                                  struct Allocator* allocator)
 {
@@ -294,15 +323,22 @@ struct RouterModule_Promise* SearchRunner_search(uint8_t target[16],
         return NULL;
     }
 
+    if (maxRequests < 1) {
+        maxRequests = SearchRunner_DEFAULT_MAX_REQUESTS;
+    }
+    if (maxRequestsIfFound < 1) {
+        maxRequestsIfFound = SearchRunner_DEFAULT_MAX_REQUESTS_IF_FOUND;
+    }
+
     struct Allocator* alloc = Allocator_child(allocator);
 
     struct Address targetAddr = { .path = 0 };
-    Bits_memcpyConst(targetAddr.ip6.bytes, target, Address_SEARCH_TARGET_SIZE);
+    Bits_memcpy(targetAddr.ip6.bytes, target, Address_SEARCH_TARGET_SIZE);
 
     struct NodeList* nodes =
         NodeStore_getClosestNodes(runner->nodeStore,
                                   &targetAddr,
-                                  MAX_REQUESTS_PER_SEARCH,
+                                  maxRequests,
                                   Version_CURRENT_PROTOCOL,
                                   alloc);
 
@@ -323,12 +359,14 @@ struct RouterModule_Promise* SearchRunner_search(uint8_t target[16],
             .alloc = alloc
         },
         .runner = runner,
-        .search = sss
+        .search = sss,
+        .maxRequests = maxRequests,
+        .maxRequestsIfFound = maxRequestsIfFound
     }));
     Identity_set(search);
     runner->searches++;
     Allocator_onFree(alloc, searchOnFree, search);
-    Bits_memcpyConst(&search->target, &targetAddr, sizeof(struct Address));
+    Bits_memcpy(&search->target, &targetAddr, sizeof(struct Address));
 
     if (runner->firstSearch) {
         search->nextSearch = runner->firstSearch;
@@ -364,7 +402,7 @@ struct SearchRunner* SearchRunner_new(struct NodeStore* nodeStore,
         .maxConcurrentSearches = SearchRunner_DEFAULT_MAX_CONCURRENT_SEARCHES
     }));
     out->searchStore = SearchStore_new(alloc, logger);
-    Bits_memcpyConst(out->myAddress, myAddress, 16);
+    Bits_memcpy(out->myAddress, myAddress, 16);
     Identity_set(out);
 
     return &out->pub;

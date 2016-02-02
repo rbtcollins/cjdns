@@ -17,6 +17,8 @@
 
 <?js file.Constant_JS = require("../util/Constant.js"); ?>
 
+#define Constant_stringForHex(hex) <?js return file.Constant_JS.stringForHex( hex ) ?>
+
 #define Constant_base2(num) <?js return file.Constant_JS.base2( #num ) ?>
 
 #define Constant_rand64() <?js return file.Constant_JS.rand64(); ?>
@@ -24,5 +26,7 @@
 #define Constant_rand32() <?js return file.Constant_JS.rand32(); ?>
 
 #define Constant_randHexString(len) <?js return file.Constant_JS.randHexString(#len); ?>
+
+#define Constant_log2(num) <?js return file.Constant_JS.log2(num); ?>
 
 #endif

@@ -13,9 +13,9 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 #include "exception/Except.h"
-#include "interface/Interface.h"
 #include "util/platform/netdev/NetPlatform.h"
 #include "util/AddrTools.h"
+#include "util/platform/Sockaddr.h"
 
 #include <errno.h>
 #include <ctype.h>
@@ -149,4 +149,14 @@ void NetPlatform_setMTU(const char* interfaceName,
        close(s);
        Except_throw(eh, "ioctl(SIOCSIFMTU) [%s]", strerror(err));
     }
+}
+
+void NetPlatform_addRoute(const char* interfaceName,
+                            const uint8_t* address,
+                            int prefixLen,
+                            int addrFam,
+                            struct Log* logger,
+                            struct Except* eh)
+{
+    Except_throw(eh, "NetPlatform_addRoute is not implemented in this platform.");
 }

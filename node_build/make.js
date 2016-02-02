@@ -29,14 +29,16 @@ var GCC = process.env['CC'];
 var CFLAGS = process.env['CFLAGS'];
 var LDFLAGS = process.env['LDFLAGS'];
 
-if (!GCC) {
-    if (SYSTEM === 'freebsd') {
-        GCC = 'gcc47';
-    } else if (SYSTEM === 'openbsd') {
-        GCC = 'egcc';
-    } else {
-        GCC = 'gcc';
-    }
+var NO_MARCH_FLAG = ['ppc', 'ppc64'];
+
+if (GCC) {
+    // Already specified.
+} else if (SYSTEM === 'openbsd') {
+    GCC = 'egcc';
+} else if (SYSTEM === 'freebsd') {
+    GCC = 'clang';
+} else {
+    GCC = 'gcc';
 }
 
 Builder.configure({
@@ -44,9 +46,18 @@ Builder.configure({
     crossCompiling: process.env['CROSS'] !== undefined,
     gcc:            GCC,
     tempDir:        '/tmp',
-    optimizeLevel:  '-O2',
+    optimizeLevel:  '-O3',
     logLevel:       process.env['Log_LEVEL'] || 'DEBUG'
 }, function (builder, waitFor) {
+
+    // This is a hack to cover for the fact that builder.js stores the cflags
+    // then more cflags get piled on top of them. TODO(cjd): Fix this is builder.js.
+    for (var i = 0; i < builder.config.cflags.length; i++) {
+        if (/CJD_PACKAGE_VERSION/.test(builder.config.cflags[i])) {
+            builder.config.cflags.splice(i-1, 2);
+        }
+    }
+
     builder.config.cflags.push(
         '-std=c99',
         '-Wall',
@@ -55,10 +66,9 @@ Builder.configure({
         '-Wno-pointer-sign',
         '-pedantic',
         '-D', builder.config.systemName + '=1',
+        '-D', 'CJD_PACKAGE_VERSION="' + builder.config.version + '"',
         '-Wno-unused-parameter',
-        '-Wno-unused-result',
-
-        '-D', 'HAS_BUILTIN_CONSTANT_P',
+        '-fomit-frame-pointer',
 
         '-D', 'Log_' + builder.config.logLevel,
 
@@ -70,20 +80,35 @@ Builder.configure({
         // v4x8 = 256 peers max, variable width, 4, or 8 bits plus 1 bit prefix
         '-D', 'NumberCompress_TYPE=v3x5x8',
 
-        // disable for speed, enable for safety
+        // enable for safety (don't worry about speed, profiling shows they add ~nothing)
         '-D', 'Identity_CHECK=1',
         '-D', 'Allocator_USE_CANARIES=1',
         '-D', 'PARANOIA=1'
     );
 
+    if (process.env['GCOV']) {
+        builder.config.cflags.push('-fprofile-arcs', '-ftest-coverage');
+        builder.config.ldflags.push('-fprofile-arcs', '-ftest-coverage');
+    }
+
+    var android = /android/i.test(builder.config.gcc);
+
     if (process.env['TESTING']) {
         builder.config.cflags.push('-D', 'TESTING=1');
+    }
+
+    if (!builder.config.crossCompiling) {
+        if (NO_MARCH_FLAG.indexOf(process.arch) < -1) {
+            builder.config.cflags.push('-march=native');
+        }
     }
 
     if (builder.config.systemName === 'win32') {
         builder.config.cflags.push('-Wno-format');
     } else if (builder.config.systemName === 'linux') {
         builder.config.ldflags.push('-Wl,-z,relro,-z,now,-z,noexecstack');
+        builder.config.cflags.push('-DHAS_ETH_INTERFACE=1');
+    } else if (builder.config.systemName === 'darwin') {
         builder.config.cflags.push('-DHAS_ETH_INTERFACE=1');
     }
 
@@ -102,7 +127,7 @@ Builder.configure({
         }
     }
 
-    if (/clang/i.test(builder.config.gcc) || builder.config.systemName === 'darwin') {
+    if (builder.config.compilerType.isClang) {
         // blows up when preprocessing before js preprocessor
         builder.config.cflags.push(
             '-Wno-invalid-pp-token',
@@ -112,14 +137,28 @@ Builder.configure({
 
             // lots of places where depending on preprocessor conditions, a statement might be
             // a case of if (1 == 1)
-            '-Wno-tautological-compare'
+            '-Wno-tautological-compare',
+
+            '-Wno-error'
         );
+        builder.config.cflags.slice(builder.config.cflags.indexOf('-Werror'), 1);
     }
 
     // Install any user-defined CFLAGS. Necessary if you are messing about with building cnacl
-    // with NEON on the BBB
+    // with NEON on the BBB, or want to set -Os (OpenWrt)
+    // Allow -O0 so while debugging all variables are present.
     if (CFLAGS) {
-        [].push.apply(builder.config.cflags, CFLAGS.split(' '));
+        var cflags = CFLAGS.split(' ');
+        cflags.forEach(function(flag) {
+             if (/^\-O[^02s]$/.test(flag)) {
+                console.log("Skipping " + flag + ", assuming " +
+                            builder.config.optimizeLevel + " instead.");
+            } else if (/^\-O[02s]$/.test(flag)) {
+                builder.config.optimizeLevel = flag;
+            } else {
+                [].push.apply(builder.config.cflags, cflags);
+            }
+        });
     }
 
     // We also need to pass various architecture/floating point flags to GCC when invoked as
@@ -128,7 +167,7 @@ Builder.configure({
         [].push.apply(builder.config.ldflags, LDFLAGS.split(' '));
     }
 
-    if (/android/i.test(builder.config.gcc)) {
+    if (android) {
         builder.config.cflags.push('-Dandroid=1');
     }
 
@@ -142,20 +181,28 @@ Builder.configure({
                 '-flto',
                 builder.config.optimizeLevel
             );
-
-            // No optimization while building since actual compile happens during linking.
-            builder.config.cflags.push('-O0');
         } else {
             console.log("Link time optimization not supported [" + err + "]");
-            builder.config.cflags.push(builder.config.optimizeLevel);
         }
+        builder.config.cflags.push(builder.config.optimizeLevel);
     });
 
     var uclibc = process.env['UCLIBC'] == '1';
-    var libssp = process.env['SSP_SUPPORT'] == 'y';
-    if (builder.config.systemName == 'win32') {
+    var libssp;
+    switch (process.env['SSP_SUPPORT']) {
+        case 'y':
+        case '1': libssp = true; break;
+        case 'n':
+        case '' :
+        case '0': libssp = false; break;
+        case undefined: break;
+        default: throw new Error();
+    }
+    if (libssp === false) {
+        console.log("Stack Smashing Protection (security feature) is disabled");
+    } else if (builder.config.systemName == 'win32') {
         builder.config.libs.push('-lssp');
-    } else if ((!uclibc && builder.config.systemName !== 'sunos') || libssp) {
+    } else if ((!uclibc && builder.config.systemName !== 'sunos') || libssp === true) {
         builder.config.cflags.push(
             // Broken GCC patch makes -fstack-protector-all not work
             // workaround is to give -fno-stack-protector first.
@@ -177,6 +224,12 @@ Builder.configure({
         }
     } else {
         console.log("Stack Smashing Protection (security feature) is disabled");
+    }
+
+    if (process.env['Pipe_PREFIX'] !== undefined) {
+        builder.config.cflags.push(
+            '-D', 'Pipe_PREFIX="' + process.env['Pipe_PREFIX'] + '"'
+        );
     }
 
     var dependencyDir = builder.config.buildDir + '/dependencies';
@@ -213,14 +266,22 @@ Builder.configure({
                     args.unshift('-fPIC');
                 }
 
-                args.unshift('-O2', '-fomit-frame-pointer');
+                args.unshift(builder.config.optimizeLevel, '-fomit-frame-pointer');
 
                 if (CFLAGS) {
                     [].push.apply(args, CFLAGS.split(' '));
                 }
 
+                if (!builder.config.crossCompiling) {
+                    if (NO_MARCH_FLAG.indexOf(process.arch) < -1) {
+                        builder.config.cflags.push('-march=native');
+                    }
+                }
+
                 builder.cc(args, callback);
-            }, waitFor(function () {
+            },
+            builder.config,
+            waitFor(function () {
                 process.chdir(cwd);
             }));
         }));
@@ -228,7 +289,7 @@ Builder.configure({
     }).nThen(function (waitFor) {
 
         builder.config.libs.push(libuvLib);
-        if (!(/android/i.test(builder.config.gcc))) {
+        if (!android) {
             builder.config.libs.push('-lpthread');
         }
 
@@ -238,9 +299,7 @@ Builder.configure({
                 '-lpsapi',   // GetProcessMemoryInfo()
                 '-liphlpapi' // GetAdapterAddresses()
             );
-        } else if (builder.config.systemName === 'linux'
-            && !(/android/i).test(builder.config.gcc))
-        {
+        } else if (builder.config.systemName === 'linux' && !android) {
             builder.config.libs.push('-lrt'); // clock_gettime()
         } else if (builder.config.systemName === 'darwin') {
             builder.config.libs.push('-framework', 'CoreServices');
@@ -290,12 +349,21 @@ Builder.configure({
             }
 
             //args.push('--root-target=libuv');
-            if (/.*android.*/.test(builder.config.gcc)) {
+            if (android) {
                 args.push('-DOS=android');
             }
 
             if (builder.config.systemName === 'win32') {
                 args.push('-DOS=win');
+            }
+
+            if (env.GYP_ADDITIONAL_ARGS) {
+                args.push.apply(args, env.GYP_ADDITIONAL_ARGS.split(' '));
+            }
+
+            if (['freebsd', 'openbsd'].indexOf(builder.config.systemName) !== -1) {
+                // This platform lacks a functioning sem_open implementation, therefore...
+                args.push('--no-parallel');
             }
 
             var gyp = Spawn(python, args, {env:env, stdio:'inherit'});
@@ -311,10 +379,12 @@ Builder.configure({
                     'CXX=' + builder.config.gcc,
                     'V=1'
                 ];
+                var cflags = [builder.config.optimizeLevel, '-DNO_EMFILE_TRICK=1'];
 
                 if (!(/darwin|win32/i.test(builder.config.systemName))) {
-                    args.push('CFLAGS=-fPIC');
+                    cflags.push('-fPIC');
                 }
+                args.push('CFLAGS=' + cflags.join(' '));
 
                 var makeCommand = ['freebsd', 'openbsd'].indexOf(builder.config.systemName) >= 0 ? 'gmake' : 'make';
                 var make = Spawn(makeCommand, args, {stdio: 'inherit'});
@@ -343,7 +413,7 @@ Builder.configure({
 
 }).build(function (builder, waitFor) {
 
-    builder.buildExecutable('admin/angel/cjdroute2.c', 'cjdroute');
+    builder.buildExecutable('client/cjdroute2.c', 'cjdroute');
 
     builder.buildExecutable('contrib/c/publictoip6.c');
     builder.buildExecutable('contrib/c/privatetopublic.c');
@@ -371,7 +441,9 @@ Builder.configure({
     if (process.env['REMOTE_TEST']) {
         testRunner = TestRunner.remote(process.env['REMOTE_TEST'], ['all']);
     }
-    builder.runTest(testcjdroute, testRunner);
+    if (!process.env['NO_TEST']) {
+        builder.runTest(testcjdroute, testRunner);
+    }
 
 }).success(function (builder, waitFor) {
 

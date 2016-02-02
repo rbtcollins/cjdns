@@ -15,9 +15,9 @@
 #ifndef TestFramework_H
 #define TestFramework_H
 
-#include "net/Ducttape.h"
+#include "net/NetCore.h"
 #include "util/Linker.h"
-Linker_require("test/TestFramework.c")
+Linker_require("test/TestFramework.c");
 
 struct TestFramework
 {
@@ -25,13 +25,9 @@ struct TestFramework
     struct Random* rand;
     struct EventBase* eventBase;
     struct Log* logger;
-    struct SwitchCore* switchCore;
-    struct Ducttape* ducttape;
-    struct CryptoAuth* cryptoAuth;
-    struct RouterModule* router;
-    struct SwitchPinger* switchPinger;
-    struct InterfaceController* ifController;
-    struct NodeStore* nodeStore;
+    struct Pathfinder* pathfinder;
+    struct Iface* tunIf;
+    struct NetCore* nc;
 
     /** The last message which this node sent. */
     struct Message* lastMsg;
@@ -57,7 +53,9 @@ struct TestFramework* TestFramework_setUp(char* privateKey,
                                           struct Random* rand,
                                           struct Log* logger);
 
-void TestFramework_linkNodes(struct TestFramework* client, struct TestFramework* server);
+void TestFramework_linkNodes(struct TestFramework* client,
+                             struct TestFramework* server,
+                             bool beacon);
 
 void TestFramework_craftIPHeader(struct Message* msg, uint8_t srcAddr[16], uint8_t destAddr[16]);
 
